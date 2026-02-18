@@ -17,11 +17,17 @@ One paragraph overview of the video content.
 
 ### [0:00] Introduction
 
-[▶ 0:00](https://youtu.be/VIDEO_ID?t=0) Brief description of this section.
+[▶ 0:00](https://youtu.be/VIDEO_ID?t=0)
+
+- First key point from this section.
+- Second key point from this section.
 
 ### [2:30] Main Topic
 
-[▶ 2:30](https://youtu.be/VIDEO_ID?t=150) Brief description of this section.
+[▶ 2:30](https://youtu.be/VIDEO_ID?t=150)
+
+- First key point from this section.
+- Second key point from this section.
 
 ## Key Takeaways
 
@@ -97,18 +103,25 @@ The tool tries these methods in order:
 
 Summarization runs in two modes based on transcript token count (using `tiktoken` with model-aware encoding):
 
-1. **Normalize transcript**: each segment is converted to `[MM:SS] text`.
-2. **Count tokens**: compute total transcript tokens.
-3. **Single-pass mode** (`<= 5000` tokens):
-   - Send the full transcript to GPT once.
-   - Get structured JSON: `summary`, `chapters`, `takeaways`.
-4. **Chunked mode** (`> 5000` tokens):
-   - Split transcript into chunks targeting about `4500` tokens each.
-   - Summarize each chunk to structured JSON.
-   - Run a final merge prompt that combines chunk summaries into one coherent full-video JSON output.
-5. **Post-process + render**:
-   - Normalize and deduplicate chapters/takeaways.
-   - Render final Markdown with clickable timestamp links.
+1. **Normalize transcript**: convert each segment to `[MM:SS] spoken text` so timestamps stay tied to content.
+2. **Count tokens**: compute transcript size with `tiktoken` (model-aware encoding; fallback to `o200k_base`).
+3. **Choose mode**:
+   - **Single-pass** when total tokens are `<= 5000`
+   - **Chunked** when total tokens are `> 5000`
+4. **Single-pass mode**:
+   - Send one GPT request with metadata, optional native YouTube chapters, and full transcript.
+   - Expect strict JSON output: `summary`, `chapters`, `takeaways`.
+5. **Chunked mode**:
+   - Split transcript into chunks targeting `5000` tokens.
+   - If the last chunk is too small (`< 25%` of chunk limit), merge it into the previous chunk.
+   - Summarize each chunk to the same JSON schema.
+   - Combine chunk summaries + chapters locally (chronological sort + dedupe).
+   - Run one final GPT request for full-video summary + takeaways.
+6. **Validate + normalize**:
+   - Parse JSON and require non-empty `summary`, `chapters`, and `takeaways`.
+   - Normalize timestamps/seconds, sort chapters chronologically, and deduplicate chapters/takeaways.
+7. **Render Markdown**:
+   - Convert the normalized structured result into the final Markdown output.
 
 This prevents long videos from being truncated and keeps output quality more proportional to transcript length.
 
@@ -118,11 +131,10 @@ These constants are defined in `src/summarizer.ts`:
 
 - `SINGLE_PASS_TOKEN_LIMIT = 5000`
   - If the full transcript is `<= 5000` tokens, the app uses single-pass summarization.
-- `CHUNK_TOKEN_LIMIT = 4500`
-  - In chunked mode, each chunk targets up to about `4500` tokens.
-  - This stays below the single-pass threshold to leave room for prompt overhead.
-- `MIN_LAST_CHUNK_RATIO = 0.35`
-  - If the final chunk is smaller than `35%` of `CHUNK_TOKEN_LIMIT`, it is merged into the previous chunk.
+- `CHUNK_TOKEN_LIMIT = 5000`
+  - In chunked mode, each chunk targets up to about `5000` tokens.
+- `MIN_LAST_CHUNK_RATIO = 0.25`
+  - If the final chunk is smaller than `25%` of `CHUNK_TOKEN_LIMIT`, it is merged into the previous chunk.
   - This avoids a tiny final chunk that usually lowers summary quality.
 
 ## Project structure

@@ -13,10 +13,13 @@ export function generateMarkdown(data: SummaryData): string {
   const chaptersSection = chapters
     .map((ch) => {
       const linkUrl = `${watchUrl}?t=${ch.seconds}`;
+      const descriptionsSection = ch.descriptions.map((line) => `- ${line}`).join('\n');
       return [
         `### [${ch.timestamp}] ${ch.title}`,
         ``,
-        `[▶ ${ch.timestamp}](${linkUrl}) ${ch.description}`,
+        `[▶ ${ch.timestamp}](${linkUrl})`,
+        ``,
+        descriptionsSection,
       ].join('\n');
     })
     .join('\n\n');

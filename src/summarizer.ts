@@ -237,7 +237,9 @@ The JSON must conform exactly to this schema:
       "timestamp": "string — display time like '0:00' or '14:32'",
       "seconds": number — the integer seconds value matching the timestamp,
       "title": "string — concise descriptive chapter title (3–8 words)",
-      "description": "string — one sentence describing this section's content"
+      "descriptions": [
+        "string — concise sentence describing one key point in this section"
+      ]
     }
   ],
   "takeaways": [
@@ -249,9 +251,10 @@ Rules:
 - Detect between ${targets.chapterCount} meaningful chapter boundaries based on topic shifts
 - If native YouTube chapters are provided, treat them as strong hints but you may add or refine them
 - timestamps must be actual times from the transcript (do not invent times)
+- Each chapter must include 2 to 4 entries in "descriptions"
 - Produce between ${targets.takeawayCount} takeaways
 - Summary length target: ${targets.summarySentences} sentences
-- Write all text fields (summary, chapter titles, descriptions, takeaways) in the same language as the transcript
+- Write all text fields (summary, chapter titles, chapter descriptions, takeaways) in the same language as the transcript
 - Do not include any text outside the JSON object`;
 }
 
@@ -285,7 +288,9 @@ The JSON must conform exactly to this schema:
       "timestamp": "string — display time like '0:00' or '14:32'",
       "seconds": number — the integer seconds value matching the timestamp,
       "title": "string — concise descriptive chapter title (3–8 words)",
-      "description": "string — one sentence describing this section's content"
+      "descriptions": [
+        "string — concise sentence describing one key point in this section"
+      ]
     }
   ],
   "takeaways": [
@@ -296,6 +301,7 @@ The JSON must conform exactly to this schema:
 Rules:
 - Use only information present in this chunk
 - Detect between 2 and 5 meaningful chapter boundaries inside this chunk
+- Each chapter must include 2 to 4 entries in "descriptions"
 - Produce between 2 and 5 takeaways
 - Summary length target: 3-5 sentences
 - timestamps must be actual times from the transcript (do not invent times)
@@ -332,39 +338,34 @@ ${chunk.text}
 Analyze ONLY this chunk and produce the JSON summary.`;
 }
 
-function buildMergeSystemPrompt(targets: OutputTargets): string {
-  return `You are an expert editor combining chunk-level transcript summaries into one final video summary.
+function buildFinalSynthesisSystemPrompt(targets: OutputTargets): string {
+  return `You are an expert editor synthesizing chunk-level transcript summaries of one YouTube video into a final global summary and key takeaways.
 
 You MUST respond with ONLY a valid JSON object — no markdown code blocks, no explanation text, no preamble.
 The JSON must conform exactly to this schema:
 
 {
   "summary": "string — one dense paragraph summarizing the full video",
-  "chapters": [
-    {
-      "timestamp": "string — display time like '0:00' or '14:32'",
-      "seconds": number — the integer seconds value matching the timestamp,
-      "title": "string — concise descriptive chapter title (3–8 words)",
-      "description": "string — one sentence describing this section's content"
-    }
-  ],
   "takeaways": [
-    "string — one actionable or insightful bullet point"
+    "string — one actionable or insightful bullet point for the full video"
   ]
 }
 
 Rules:
-- Merge chunk outputs into one coherent full-video summary
-- Preserve chronological flow and remove duplicated points
-- Detect between ${targets.chapterCount} meaningful chapter boundaries
-- Produce between ${targets.takeawayCount} takeaways
+- Use only the provided chunk summaries and chunk chapters as source material
+- Remove duplicates and near-duplicates
+- Cover the main ideas across the full timeline of the video
+- Write a global full-video summary, not per-chunk summaries
 - Summary length target: ${targets.summarySentences} sentences
-- timestamps must be actual times from the source chunk summaries
-- Write all text fields in the same language as the transcript
+- Produce between ${targets.takeawayCount} takeaways
+- Write summary and takeaways in the same language as the transcript
 - Do not include any text outside the JSON object`;
 }
 
-function buildMergeUserPrompt(metadata: VideoMetadata, chunkSummaries: ChunkSummary[]): string {
+function buildFinalSynthesisUserPrompt(
+  metadata: VideoMetadata,
+  chunkSummaries: ChunkSummary[]
+): string {
   const nativeChaptersSection = formatNativeChaptersSection(metadata.nativeChapters);
   const chunkPayload = chunkSummaries.map((chunk) => ({
     chunk: chunk.chunkIndex + 1,
@@ -386,7 +387,12 @@ ${nativeChaptersSection}
 CHUNK SUMMARIES (JSON):
 ${JSON.stringify(chunkPayload, null, 2)}
 
-Combine all chunk summaries into one final JSON summary for the whole video.`;
+Generate a final full-video summary and key takeaways as JSON.`;
+}
+
+function combineChunkChapters(chunkSummaries: ChunkSummary[]): Chapter[] {
+  const combinedChapters = chunkSummaries.flatMap((chunk) => chunk.result.chapters);
+  return normalizeChapters(combinedChapters);
 }
 
 // ─── GPT Summarization ────────────────────────────────────────────────────────
@@ -424,6 +430,38 @@ async function requestStructuredSummary(
   }
 
   return normalizeSummary(parsed);
+}
+
+async function requestFinalSynthesis(
+  openai: OpenAI,
+  model: string,
+  stage: string,
+  instructions: string,
+  input: string
+): Promise<Pick<GptSummaryResponse, 'summary' | 'takeaways'>> {
+  let rawContent: string;
+  try {
+    const response = await openai.responses.create({
+      model,
+      instructions,
+      input,
+      text: { format: { type: 'json_object' } },
+    });
+
+    rawContent = response.output_text ?? '';
+  } catch (err) {
+    throw new Error(
+      `GPT API call failed during ${stage}.\n` +
+        `Check that OPENAI_API_KEY is valid and has sufficient quota.\n` +
+        `Details: ${String(err)}`
+    );
+  }
+
+  try {
+    return parseFinalSynthesisResponse(rawContent);
+  } catch (err) {
+    throw new Error(`Failed to parse GPT response during ${stage}: ${String(err)}`);
+  }
 }
 
 /**
@@ -500,15 +538,23 @@ export async function summarizeWithGpt(
     });
   }
 
-  console.log(`Merging ${chunkSummaries.length} chunk summaries into final output...`);
+  console.log(`Combining ${chunkSummaries.length} chunk chapters without merge stage...`);
+  const combinedChapters = combineChunkChapters(chunkSummaries);
 
-  return requestStructuredSummary(
+  console.log('Generating final summary and takeaways from chunk summaries...');
+  const finalSynthesis = await requestFinalSynthesis(
     openai,
     model,
-    'chunk-merge summarization',
-    buildMergeSystemPrompt(targets),
-    buildMergeUserPrompt(metadata, chunkSummaries)
+    'chunk-final synthesis',
+    buildFinalSynthesisSystemPrompt(targets),
+    buildFinalSynthesisUserPrompt(metadata, chunkSummaries)
   );
+
+  return normalizeSummary({
+    summary: finalSynthesis.summary,
+    chapters: combinedChapters,
+    takeaways: finalSynthesis.takeaways,
+  });
 }
 
 // ─── Response Parsing ─────────────────────────────────────────────────────────
@@ -555,12 +601,24 @@ function parseGptResponse(raw: string): GptSummaryResponse {
     if (typeof ch['timestamp'] !== 'string') throw new Error(`Chapter ${i} missing "timestamp".`);
     if (typeof ch['seconds'] !== 'number') throw new Error(`Chapter ${i} missing "seconds".`);
     if (typeof ch['title'] !== 'string') throw new Error(`Chapter ${i} missing "title".`);
-    if (typeof ch['description'] !== 'string') throw new Error(`Chapter ${i} missing "description".`);
+    let descriptions: string[];
+    if (Array.isArray(ch['descriptions'])) {
+      descriptions = (ch['descriptions'] as unknown[]).filter(
+        (item): item is string => typeof item === 'string'
+      );
+    } else if (typeof ch['description'] === 'string') {
+      descriptions = [ch['description']];
+    } else {
+      throw new Error(`Chapter ${i} missing "descriptions".`);
+    }
+    if (descriptions.length === 0) {
+      throw new Error(`Chapter ${i} has empty "descriptions".`);
+    }
     return {
       timestamp: ch['timestamp'] as string,
       seconds: ch['seconds'] as number,
       title: ch['title'] as string,
-      description: ch['description'] as string,
+      descriptions,
     };
   });
 
@@ -575,10 +633,60 @@ function parseGptResponse(raw: string): GptSummaryResponse {
   };
 }
 
-function normalizeSummary(result: GptSummaryResponse): GptSummaryResponse {
-  const summary = result.summary.trim();
+function parseFinalSynthesisResponse(
+  raw: string
+): Pick<GptSummaryResponse, 'summary' | 'takeaways'> {
+  if (!raw || raw.trim() === '') {
+    throw new Error('GPT returned an empty response.');
+  }
 
-  const sortedChapters = result.chapters
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    throw new Error(
+      `GPT response was not valid JSON.\n` +
+        `Raw response:\n${raw.slice(0, 500)}\n` +
+        `Parse error: ${String(err)}`
+    );
+  }
+
+  if (typeof parsed !== 'object' || parsed === null) {
+    throw new Error(`GPT response was not a JSON object. Got: ${typeof parsed}`);
+  }
+
+  const obj = parsed as Record<string, unknown>;
+  if (typeof obj['summary'] !== 'string' || obj['summary'].trim() === '') {
+    throw new Error('GPT response missing or empty "summary" field.');
+  }
+  if (!Array.isArray(obj['takeaways']) || obj['takeaways'].length === 0) {
+    throw new Error('GPT response missing or empty "takeaways" array.');
+  }
+
+  const takeaways = (obj['takeaways'] as unknown[]).filter(
+    (item): item is string => typeof item === 'string'
+  );
+
+  return {
+    summary: (obj['summary'] as string).trim(),
+    takeaways: normalizeTakeaways(takeaways),
+  };
+}
+
+function normalizeTakeaways(items: string[]): string[] {
+  const takeaways = Array.from(
+    new Set(items.map((item) => item.trim()).filter((item) => item !== ''))
+  );
+
+  if (takeaways.length === 0) {
+    throw new Error('GPT response has no valid takeaways after normalization.');
+  }
+
+  return takeaways;
+}
+
+function normalizeChapters(chapters: Chapter[]): Chapter[] {
+  const sortedChapters = chapters
     .map((chapter) => {
       const seconds = Math.max(0, Math.round(chapter.seconds));
       const timestamp = chapter.timestamp.trim() || secondsToTimestamp(seconds);
@@ -587,10 +695,16 @@ function normalizeSummary(result: GptSummaryResponse): GptSummaryResponse {
         seconds,
         timestamp,
         title: chapter.title.trim(),
-        description: chapter.description.trim(),
+        descriptions: Array.from(
+          new Set(
+            chapter.descriptions
+              .map((description) => description.trim())
+              .filter((description) => description !== '')
+          )
+        ),
       };
     })
-    .filter((chapter) => chapter.title !== '' && chapter.description !== '')
+    .filter((chapter) => chapter.title !== '' && chapter.descriptions.length > 0)
     .sort((a, b) => a.seconds - b.seconds);
 
   const dedupedChapters: Chapter[] = [];
@@ -602,18 +716,21 @@ function normalizeSummary(result: GptSummaryResponse): GptSummaryResponse {
     dedupedChapters.push(chapter);
   }
 
-  const takeaways = Array.from(
-    new Set(result.takeaways.map((item) => item.trim()).filter((item) => item !== ''))
-  );
-
-  if (summary === '') {
-    throw new Error('GPT response summary is empty after normalization.');
-  }
   if (dedupedChapters.length === 0) {
     throw new Error('GPT response has no valid chapters after normalization.');
   }
-  if (takeaways.length === 0) {
-    throw new Error('GPT response has no valid takeaways after normalization.');
+
+  return dedupedChapters;
+}
+
+function normalizeSummary(result: GptSummaryResponse): GptSummaryResponse {
+  const summary = result.summary.trim();
+  const dedupedChapters = normalizeChapters(result.chapters);
+
+  const takeaways = normalizeTakeaways(result.takeaways);
+
+  if (summary === '') {
+    throw new Error('GPT response summary is empty after normalization.');
   }
 
   return {

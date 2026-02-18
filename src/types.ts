@@ -21,8 +21,8 @@ export interface Chapter {
   seconds: number;
   /** GPT-generated chapter title */
   title: string;
-  /** GPT-generated one-sentence description */
-  description: string;
+  /** GPT-generated description points for this chapter */
+  descriptions: string[];
 }
 
 /**
