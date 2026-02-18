@@ -88,11 +88,42 @@ youtube2md --url https://youtu.be/VIDEO_ID
 
 ## Transcript strategy
 
-The tool tries three methods in order:
+The tool tries these methods in order:
 
-1. **YouTube captions** — official subtitles if available
-2. **Auto-generated captions** — YouTube's automatic captions (built-in fallback)
-3. **OpenAI Whisper STT** — downloads audio and transcribes it (requires API quota; audio must be under 25 MB)
+1. **YouTube captions via Android Innertube** — uses YouTube caption tracks when available (official or auto-generated)
+2. **OpenAI Whisper STT fallback** — downloads audio and transcribes it when captions are unavailable (requires API quota; audio must be under 25 MB)
+
+## Summary process
+
+Summarization runs in two modes based on transcript token count (using `tiktoken` with model-aware encoding):
+
+1. **Normalize transcript**: each segment is converted to `[MM:SS] text`.
+2. **Count tokens**: compute total transcript tokens.
+3. **Single-pass mode** (`<= 5000` tokens):
+   - Send the full transcript to GPT once.
+   - Get structured JSON: `summary`, `chapters`, `takeaways`.
+4. **Chunked mode** (`> 5000` tokens):
+   - Split transcript into chunks targeting about `4500` tokens each.
+   - Summarize each chunk to structured JSON.
+   - Run a final merge prompt that combines chunk summaries into one coherent full-video JSON output.
+5. **Post-process + render**:
+   - Normalize and deduplicate chapters/takeaways.
+   - Render final Markdown with clickable timestamp links.
+
+This prevents long videos from being truncated and keeps output quality more proportional to transcript length.
+
+### Token thresholds
+
+These constants are defined in `src/summarizer.ts`:
+
+- `SINGLE_PASS_TOKEN_LIMIT = 5000`
+  - If the full transcript is `<= 5000` tokens, the app uses single-pass summarization.
+- `CHUNK_TOKEN_LIMIT = 4500`
+  - In chunked mode, each chunk targets up to about `4500` tokens.
+  - This stays below the single-pass threshold to leave room for prompt overhead.
+- `MIN_LAST_CHUNK_RATIO = 0.35`
+  - If the final chunk is smaller than `35%` of `CHUNK_TOKEN_LIMIT`, it is merged into the previous chunk.
+  - This avoids a tiny final chunk that usually lowers summary quality.
 
 ## Project structure
 
