@@ -1,0 +1,31 @@
+{
+  "name": "youtube2md",
+  "version": "1.0.0",
+  "description": "Convert a YouTube video to a Markdown summary file",
+  "main": "dist/index.js",
+  "bin": {
+    "youtube2md": "./dist/index.js"
+  },
+  "type": "module",
+  "scripts": {
+    "build": "tsc && chmod +x dist/index.js",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@distube/ytdl-core": "^4.14.4",
+    "commander": "^12.1.0",
+    "dotenv": "^16.4.5",
+    "openai": "^5.0.0",
+    "youtube-transcript": "^1.2.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.16.0",
+    "typescript": "^5.5.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
