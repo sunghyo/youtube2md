@@ -29,20 +29,46 @@ export function parseCli(): CliOptions {
       '--out <path>',
       'Output file path (default: ./summaries/<video_id>.md)'
     )
+    .option(
+      '--out-dir <dir>',
+      'Output directory; file is named <video_id>.md (default: ./summaries)'
+    )
+    .option(
+      '--extract-only',
+      'Skip summarization and output raw transcript data as JSON'
+    )
+    .option(
+      '--json',
+      'Emit results as JSON (machine-readable); errors also output as JSON'
+    )
+    .option(
+      '--stdout',
+      'Write output to stdout instead of a file'
+    )
     .addHelpText(
       'after',
       `
 Examples:
   $ youtube2md --url https://www.youtube.com/watch?v=dQw4w9WgXcQ
   $ youtube2md --url https://youtu.be/dQw4w9WgXcQ --out ./notes/video.md
-  $ youtube2md --url https://youtu.be/dQw4w9WgXcQ --out ./dQw4w9WgXcQ.md
   $ youtube2md --url https://youtu.be/dQw4w9WgXcQ --lang English
+  $ youtube2md --url https://youtu.be/dQw4w9WgXcQ --extract-only --stdout
+  $ youtube2md --url https://youtu.be/dQw4w9WgXcQ --json --out-dir ./output
     `
     );
 
   program.parse(process.argv);
 
-  const opts = program.opts<{ url: string; out?: string; lang?: string; model?: string }>();
+  const opts = program.opts<{
+    url: string;
+    out?: string;
+    outDir?: string;
+    lang?: string;
+    model?: string;
+    extractOnly?: boolean;
+    json?: boolean;
+    stdout?: boolean;
+  }>();
 
   if (!isYouTubeUrl(opts.url)) {
     console.error(
@@ -58,8 +84,12 @@ Examples:
   return {
     url: opts.url,
     out: opts.out,
+    outDir: opts.outDir,
     lang: language && language.length > 0 ? language : undefined,
     model: opts.model?.trim() || undefined,
+    extractOnly: opts.extractOnly ?? false,
+    json: opts.json ?? false,
+    stdout: opts.stdout ?? false,
   };
 }
 

@@ -68,11 +68,53 @@ export interface SummaryData {
 }
 
 /**
+ * Structured error codes for machine-readable output.
+ */
+export type ErrorCode =
+  | 'E_TRANSCRIPT_UNAVAILABLE'
+  | 'E_OPENAI_AUTH'
+  | 'E_OPENAI_RATE_LIMIT'
+  | 'E_WHISPER_FAILED'
+  | 'E_NETWORK'
+  | 'E_WRITE_FAILED';
+
+/**
+ * Thrown internally to carry a structured error code through the pipeline.
+ * Caught at the top level and emitted as JSON when --json is active.
+ */
+export class AppError extends Error {
+  constructor(
+    public readonly code: ErrorCode,
+    message: string
+  ) {
+    super(message);
+    this.name = 'AppError';
+  }
+}
+
+/**
+ * JSON output from --extract-only mode.
+ */
+export interface ExtractOutput {
+  ok: true;
+  videoId: string;
+  metadata: VideoMetadata;
+  segments: TranscriptSegment[];
+}
+
+/**
  * Parsed CLI arguments.
  */
 export interface CliOptions {
   url: string;
   out?: string;
+  outDir?: string;
   lang?: string;
   model?: string;
+  /** Skip summarization; output raw transcript data only */
+  extractOnly: boolean;
+  /** Emit JSON to stdout instead of human-readable text */
+  json: boolean;
+  /** Write results to stdout instead of a file */
+  stdout: boolean;
 }

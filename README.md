@@ -5,6 +5,11 @@
 
 Convert any YouTube video into a structured Markdown summary — with chapter detection, clickable timestamp links, and key takeaways.
 
+Two modes:
+
+- **Standalone** — fetch transcript + summarize with OpenAI → write Markdown file
+- **Extract-only** — fetch transcript only, no API key required → output JSON for external processing
+
 ## Install
 
 ```bash
@@ -23,17 +28,26 @@ OPENAI_API_KEY=sk-... npx youtube2md --url https://youtu.be/VIDEO_ID
 # Basic usage
 youtube2md --url https://www.youtube.com/watch?v=VIDEO_ID
 
-# With custom output path
+# Custom output path
 youtube2md --url https://youtu.be/VIDEO_ID --out ./notes/video.md
+
+# Custom output directory (files saved as <video_id>.md)
+youtube2md --url https://youtu.be/VIDEO_ID --out-dir ./output
 
 # Set summary language
 youtube2md --url https://youtu.be/VIDEO_ID --lang Korean
 
 # Use a specific model
-youtube2md --url https://youtu.be/VIDEO_ID --model gpt-4o-mini
+youtube2md --url https://youtu.be/VIDEO_ID --model gpt-5-mini
+
+# Extract transcript only (no API key required if captions are available)
+youtube2md --url https://youtu.be/VIDEO_ID --extract-only
+
+# Machine-readable JSON output from full pipeline
+youtube2md --url https://youtu.be/VIDEO_ID --json --stdout
 ```
 
-Output is saved to `./summaries/<video_id>.md` by default.
+Output is saved to `./summaries/<video_id>.md` (full pipeline) or `./summaries/<video_id>.json` (extract-only) by default.
 
 ### Options
 
@@ -42,20 +56,24 @@ Output is saved to `./summaries/<video_id>.md` by default.
 | `--url <youtube_url>` | YouTube video URL (required) |
 | `--model <model>` | OpenAI model to use (default: `gpt-5-mini`). Overrides `OPENAI_MODEL` env var. |
 | `--lang <language>` | Summary output language (default: same as transcript language) |
-| `--out <path>` | Output file path (default: `./summaries/<video_id>.md`). Use `--out ./<video_id>.md` to save in the current directory. |
+| `--out <path>` | Output file path |
+| `--out-dir <dir>` | Output directory; file is named `<video_id>.md` (default: `./summaries`) |
+| `--extract-only` | Skip summarization, output raw transcript as JSON |
+| `--json` | Emit result as JSON (success and errors); progress logs go to stderr |
+| `--stdout` | Write output to stdout instead of a file |
 | `--help` | Show help |
 | `--version` | Show version |
 
 ## Requirements
 
 - Node.js 18+
-- OpenAI API key with access to GPT-4/5 models
+- OpenAI API key — required for summarization; **not required** for `--extract-only` when captions are available
 
 ## Environment variables
 
 | Variable | Description |
 |---|---|
-| `OPENAI_API_KEY` | Required. Your OpenAI API key. |
+| `OPENAI_API_KEY` | Required for summarization. Not needed in `--extract-only` mode if captions are available. |
 | `OPENAI_MODEL` | Optional. Fallback model if `--model` is not passed (default: `gpt-5-mini`). |
 
 Set your API key before running:
@@ -72,6 +90,8 @@ OPENAI_API_KEY=sk-...
 ```
 
 ## Output format
+
+### Markdown (full pipeline)
 
 ```markdown
 # Video Title
@@ -91,64 +111,95 @@ One paragraph overview of the video content.
 - First key point from this section.
 - Second key point from this section.
 
-### [2:30] Main Topic
-
-[▶ 2:30](https://youtu.be/VIDEO_ID?t=150)
-
-- First key point from this section.
-- Second key point from this section.
-
 ## Key Takeaways
 
 - Key point 1
 - Key point 2
 ```
 
+### JSON (extract-only)
+
+```json
+{
+  "ok": true,
+  "videoId": "VIDEO_ID",
+  "metadata": {
+    "videoId": "VIDEO_ID",
+    "title": "Video Title",
+    "duration": "12:34",
+    "publishDate": "2024-01-01",
+    "nativeChapters": []
+  },
+  "segments": [
+    { "text": "Hello world", "startSeconds": 0.0, "durationSeconds": 2.4 }
+  ]
+}
+```
+
+### JSON (full pipeline with `--json`)
+
+```json
+{
+  "ok": true,
+  "videoId": "VIDEO_ID",
+  "metadata": { "..." },
+  "outputPath": "/path/to/summaries/VIDEO_ID.md"
+}
+```
+
+### Error JSON
+
+All errors emit a structured object when `--json` is active:
+
+```json
+{ "ok": false, "code": "E_TRANSCRIPT_UNAVAILABLE", "message": "..." }
+```
+
+| Code | Cause |
+|---|---|
+| `E_TRANSCRIPT_UNAVAILABLE` | No captions found and Whisper fallback unavailable |
+| `E_OPENAI_AUTH` | `OPENAI_API_KEY` missing or invalid |
+| `E_OPENAI_RATE_LIMIT` | OpenAI rate limit hit |
+| `E_WHISPER_FAILED` | Whisper STT transcription failed |
+| `E_NETWORK` | Network or YouTube access error |
+| `E_WRITE_FAILED` | Could not write output file |
+
 ## Transcript strategy
 
 The tool tries these methods in order:
 
-1. **YouTube captions via Android Innertube** — uses caption tracks from YouTube directly (supports `json3` and XML timedtext formats)
-2. **`youtube-transcript` fallback** — retries transcript extraction with an alternate parser path
-3. **OpenAI Whisper STT fallback** — downloads audio and transcribes it when captions are unavailable (requires API quota; audio must be under 25 MB)
+1. **YouTube captions via Android Innertube** — uses caption tracks directly (supports `json3` and XML timedtext formats)
+2. **`youtube-transcript` fallback** — retries with an alternate parser path
+3. **OpenAI Whisper STT fallback** — downloads audio and transcribes it (requires `OPENAI_API_KEY`; audio must be under 25 MB). Skipped in `--extract-only` mode when no API key is set.
 
 ## Summary process
 
 Summarization runs in two modes based on transcript token count (using `tiktoken` with model-aware encoding):
 
-1. **Normalize transcript**: convert each segment to `[MM:SS] spoken text` so timestamps stay tied to content.
-2. **Count tokens**: compute transcript size with `tiktoken` (model-aware encoding; fallback to `o200k_base`).
+1. **Normalize transcript**: convert each segment to `[MM:SS] spoken text`.
+2. **Count tokens**: compute transcript size with `tiktoken` (fallback to `o200k_base`).
 3. **Choose mode**:
    - **Single-pass** when total tokens are `<= 5000`
    - **Chunked** when total tokens are `> 5000`
-4. **Single-pass mode**:
-   - Send one GPT request with metadata, optional native YouTube chapters, and full transcript.
-   - Expect strict JSON output: `summary`, `chapters`, `takeaways`.
+4. **Single-pass mode**: one GPT request with metadata, native YouTube chapters, and full transcript.
 5. **Chunked mode**:
-   - Split transcript into chunks targeting `5000` tokens.
-   - If the last chunk is too small (`< 25%` of chunk limit), merge it into the previous chunk.
-   - Summarize each chunk to the same JSON schema.
-   - Combine chunk summaries + chapters locally (chronological sort + dedupe).
-   - Run one final GPT request for full-video summary + takeaways.
-6. **Validate + normalize**:
-   - Parse JSON and require non-empty `summary`, `chapters`, and `takeaways`.
-   - Normalize timestamps/seconds, sort chapters chronologically, and deduplicate chapters/takeaways.
-7. **Render Markdown**:
-   - Convert the normalized structured result into the final Markdown output.
-
-This prevents long videos from being truncated and keeps output quality more proportional to transcript length.
+   - Split into chunks targeting `5000` tokens.
+   - Merge tiny final chunk (`< 25%` of limit) into the previous chunk.
+   - Summarize each chunk in parallel (up to 4 concurrent jobs).
+   - Combine chapters locally (chronological sort + dedupe).
+   - One final GPT request for full-video summary and takeaways.
+6. **Validate + normalize**: require non-empty `summary`, `chapters`, `takeaways`; sort and deduplicate.
+7. **Render Markdown**: convert to final output.
 
 ### Token thresholds
 
-These constants are defined in `src/summarizer.ts`:
+Defined in `src/summarizer.ts`:
 
-- `SINGLE_PASS_TOKEN_LIMIT = 5000`
-  - If the full transcript is `<= 5000` tokens, the app uses single-pass summarization.
-- `CHUNK_TOKEN_LIMIT = 5000`
-  - In chunked mode, each chunk targets up to about `5000` tokens.
-- `MIN_LAST_CHUNK_RATIO = 0.25`
-  - If the final chunk is smaller than `25%` of `CHUNK_TOKEN_LIMIT`, it is merged into the previous chunk.
-  - This avoids a tiny final chunk that usually lowers summary quality.
+| Constant | Value | Meaning |
+|---|---|---|
+| `SINGLE_PASS_TOKEN_LIMIT` | `5000` | Use single-pass below this |
+| `CHUNK_TOKEN_LIMIT` | `5000` | Target tokens per chunk |
+| `MIN_LAST_CHUNK_RATIO` | `0.25` | Merge final chunk if smaller than 25% of limit |
 
 ---
 
@@ -180,12 +231,12 @@ npm run clean   # Remove dist/
 
 ```
 src/
-├── index.ts       # Entry point — orchestrates all steps
+├── index.ts       # Entry point — pipeline branching and orchestration
 ├── cli.ts         # CLI argument parsing (Commander)
 ├── youtube.ts     # Metadata fetch + transcript fetch with fallback
 ├── summarizer.ts  # OpenAI Responses API prompting + JSON parsing
 ├── markdown.ts    # Markdown generation + file writing
-└── types.ts       # Shared TypeScript interfaces
+└── types.ts       # Shared interfaces, AppError, error codes
 summaries/         # Default output directory
 ```
 

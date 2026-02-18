@@ -2,9 +2,12 @@
 
 // dotenv/config must be imported first so env vars are loaded before anything reads them
 import 'dotenv/config';
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+
+// Pre-parse --json flag before full CLI parsing so early errors can be emitted as JSON
+let jsonMode = process.argv.includes('--json');
 
 function configureYtdlDebugPath(): void {
   if (process.env['YTDL_DEBUG_PATH']) {
@@ -26,106 +29,182 @@ import OpenAI from 'openai';
 import { parseCli } from './cli.js';
 import { extractVideoId, fetchVideoMetadata, fetchTranscript } from './youtube.js';
 import { summarizeWithGpt } from './summarizer.js';
-import { generateMarkdown, resolveOutputPath, writeMarkdownFile } from './markdown.js';
-import type { SummaryData } from './types.js';
+import { generateMarkdown, writeMarkdownFile } from './markdown.js';
+import type { SummaryData, CliOptions } from './types.js';
+import { AppError } from './types.js';
 
-async function main(): Promise<void> {
-  // Step 1: Parse and validate CLI arguments
-  const { url, out, lang, model: cliModel } = parseCli();
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
-  // Step 2: Validate environment
-  const apiKey = process.env['OPENAI_API_KEY'];
-  if (!apiKey || apiKey.trim() === '') {
-    console.error(
-      'Error: OPENAI_API_KEY environment variable is not set.\n' +
-        'Set it in your .env file or export it in your shell:\n' +
-        '  export OPENAI_API_KEY=sk-...'
-    );
-    process.exit(1);
-  }
+/**
+ * Resolves output file path from CLI options.
+ * Priority: --out > --out-dir/<videoId>.<ext> > ./summaries/<videoId>.<ext>
+ */
+function computeOutputPath(videoId: string, opts: CliOptions, ext: string): string {
+  if (opts.out) return path.resolve(opts.out);
+  const dir = opts.outDir
+    ? path.resolve(opts.outDir)
+    : path.resolve(process.cwd(), 'summaries');
+  return path.join(dir, `${videoId}.${ext}`);
+}
 
-  const openai = new OpenAI({ apiKey });
-  const model = cliModel ?? process.env['OPENAI_MODEL'] ?? 'gpt-5-mini';
+// ─── Extract-only pipeline ────────────────────────────────────────────────────
 
-  // Step 3: Extract video ID
-  let videoId: string;
-  try {
-    videoId = extractVideoId(url);
-  } catch (err) {
-    console.error(`Error: ${String(err)}`);
-    process.exit(1);
-  }
+async function runExtractPipeline(opts: CliOptions): Promise<void> {
+  const videoId = extractVideoId(opts.url);
+
+  // OpenAI is optional in extract-only mode (only needed for Whisper fallback)
+  const apiKey = process.env['OPENAI_API_KEY']?.trim();
+  const openai = apiKey ? new OpenAI({ apiKey }) : null;
 
   console.log(`Processing video: ${videoId}`);
 
-  // Step 4: Fetch metadata
-  let metadata: Awaited<ReturnType<typeof fetchVideoMetadata>>;
-  try {
-    console.log('Fetching video metadata...');
-    metadata = await fetchVideoMetadata(videoId);
-    console.log(`Title: "${metadata.title}" | Duration: ${metadata.duration}`);
-    if (metadata.nativeChapters.length > 0) {
-      console.log(`Found ${metadata.nativeChapters.length} native YouTube chapter(s).`);
-    }
-  } catch (err) {
-    console.error(`Error fetching metadata: ${String(err)}`);
-    process.exit(1);
+  console.log('Fetching video metadata...');
+  const metadata = await fetchVideoMetadata(videoId);
+  console.log(`Title: "${metadata.title}" | Duration: ${metadata.duration}`);
+
+  console.log('Fetching transcript...');
+  const segments = await fetchTranscript(videoId, openai);
+  console.log(`Transcript fetched: ${segments.length} segments.`);
+
+  const output = JSON.stringify({ ok: true, videoId, metadata, segments }, null, 2);
+
+  if (opts.stdout) {
+    process.stdout.write(output + '\n');
+    return;
   }
 
-  // Step 5: Fetch transcript (with fallback to Whisper)
-  let segments: Awaited<ReturnType<typeof fetchTranscript>>;
+  const outPath = computeOutputPath(videoId, opts, 'json');
   try {
-    segments = await fetchTranscript(videoId, openai);
-    console.log(`Transcript fetched: ${segments.length} segments.`);
+    mkdirSync(path.dirname(outPath), { recursive: true });
+    writeFileSync(outPath, output, 'utf-8');
   } catch (err) {
-    console.error(
-      `Error: Could not fetch transcript through any method.\n` +
-        `${String(err)}\n\n` +
-        `Possible causes:\n` +
-        `  - The video has no captions and audio download failed\n` +
-        `  - The video is private or age-restricted\n` +
-        `  - OPENAI_API_KEY lacks audio transcription access`
+    throw new AppError('E_WRITE_FAILED', String(err));
+  }
+  console.log(`\nExtract complete! Written to:\n  ${outPath}`);
+}
+
+// ─── Full pipeline ────────────────────────────────────────────────────────────
+
+async function runFullPipeline(opts: CliOptions): Promise<void> {
+  const apiKey = process.env['OPENAI_API_KEY']?.trim();
+  if (!apiKey) {
+    throw new AppError(
+      'E_OPENAI_AUTH',
+      'OPENAI_API_KEY is not set.\n' +
+        'Set it in your .env file or export it in your shell:\n' +
+        '  export OPENAI_API_KEY=sk-...\n' +
+        'Tip: use --extract-only to fetch transcripts without an API key.'
     );
-    process.exit(1);
   }
 
-  // Step 6: Summarize with GPT
+  const openai = new OpenAI({ apiKey });
+  const model = opts.model ?? process.env['OPENAI_MODEL'] ?? 'gpt-5-mini';
+
+  const videoId = extractVideoId(opts.url);
+  console.log(`Processing video: ${videoId}`);
+
+  console.log('Fetching video metadata...');
+  const metadata = await fetchVideoMetadata(videoId);
+  console.log(`Title: "${metadata.title}" | Duration: ${metadata.duration}`);
+  if (metadata.nativeChapters.length > 0) {
+    console.log(`Found ${metadata.nativeChapters.length} native YouTube chapter(s).`);
+  }
+
+  console.log('Fetching transcript...');
+  const segments = await fetchTranscript(videoId, openai);
+  console.log(`Transcript fetched: ${segments.length} segments.`);
+
+  if (opts.lang) {
+    console.log(`Summary language override: ${opts.lang}`);
+  } else {
+    console.log('Summary language: same as transcript');
+  }
+
   let gptResult: Awaited<ReturnType<typeof summarizeWithGpt>>;
   try {
-    if (lang) {
-      console.log(`Summary language override: ${lang}`);
-    } else {
-      console.log('Summary language: same as transcript');
-    }
-
-    gptResult = await summarizeWithGpt(openai, segments, metadata, model, lang);
-    console.log(`GPT summary complete: ${gptResult.chapters.length} chapters detected.`);
+    gptResult = await summarizeWithGpt(openai, segments, metadata, model, opts.lang);
   } catch (err) {
-    console.error(`Error during GPT summarization: ${String(err)}`);
-    process.exit(1);
+    const msg = String(err);
+    if (msg.includes('401') || /invalid.api.key/i.test(msg) || /authentication/i.test(msg)) {
+      throw new AppError('E_OPENAI_AUTH', msg);
+    }
+    if (msg.includes('429') || /rate.limit/i.test(msg)) {
+      throw new AppError('E_OPENAI_RATE_LIMIT', msg);
+    }
+    throw err;
   }
+  console.log(`GPT summary complete: ${gptResult.chapters.length} chapters detected.`);
 
-  // Step 7: Generate and write Markdown
   const summaryData: SummaryData = {
     metadata,
     summary: gptResult.summary,
     chapters: gptResult.chapters,
     takeaways: gptResult.takeaways,
   };
-
   const markdown = generateMarkdown(summaryData);
-  const outputPath = resolveOutputPath(videoId, out);
 
+  if (opts.stdout) {
+    if (opts.json) {
+      process.stdout.write(
+        JSON.stringify({ ok: true, videoId, metadata, markdown }, null, 2) + '\n'
+      );
+    } else {
+      process.stdout.write(markdown);
+    }
+    return;
+  }
+
+  const outPath = computeOutputPath(videoId, opts, 'md');
   try {
-    writeMarkdownFile(outputPath, markdown);
-    console.log(`\nDone! Summary written to:\n  ${outputPath}`);
+    writeMarkdownFile(outPath, markdown);
   } catch (err) {
-    console.error(`Error writing output file: ${String(err)}`);
-    process.exit(1);
+    throw new AppError('E_WRITE_FAILED', String(err));
+  }
+
+  if (opts.json) {
+    process.stdout.write(
+      JSON.stringify({ ok: true, videoId, metadata, outputPath: outPath }, null, 2) + '\n'
+    );
+  } else {
+    console.log(`\nDone! Summary written to:\n  ${outPath}`);
+  }
+}
+
+// ─── Entry point ──────────────────────────────────────────────────────────────
+
+async function main(): Promise<void> {
+  const opts = parseCli();
+  jsonMode = opts.json;
+
+  // Redirect progress logs to stderr so stdout stays clean for data output
+  if (opts.json || opts.stdout) {
+    console.log = (...args: unknown[]) => console.error(...args);
+  }
+
+  if (opts.extractOnly) {
+    await runExtractPipeline(opts);
+  } else {
+    await runFullPipeline(opts);
   }
 }
 
 main().catch((err) => {
-  console.error('Unexpected error:', err);
+  if (err instanceof AppError) {
+    if (jsonMode) {
+      process.stdout.write(
+        JSON.stringify({ ok: false, code: err.code, message: err.message }) + '\n'
+      );
+    } else {
+      process.stderr.write(`Error [${err.code}]: ${err.message}\n`);
+    }
+  } else {
+    if (jsonMode) {
+      process.stdout.write(
+        JSON.stringify({ ok: false, code: 'E_UNKNOWN', message: String(err) }) + '\n'
+      );
+    } else {
+      console.error('Unexpected error:', err);
+    }
+  }
   process.exit(1);
 });

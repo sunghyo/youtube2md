@@ -141,4 +141,4 @@ vite.config.ts.timestamp-*
 # ytdl-core debug cache
 .cache/
 
-summaries/*.md
+summaries/*.*

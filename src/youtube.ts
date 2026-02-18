@@ -5,6 +5,7 @@ import path from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import type OpenAI from 'openai';
 import { YoutubeTranscript } from 'youtube-transcript';
+import { AppError } from './types.js';
 import type { VideoMetadata, TranscriptSegment, NativeChapter } from './types.js';
 
 // ─── URL Parsing ──────────────────────────────────────────────────────────────
@@ -89,11 +90,14 @@ interface CaptionTrack {
  * Fetches a transcript using three strategies in order:
  * 1. Android Innertube client captions (supports JSON3 + XML timedtext formats)
  * 2. youtube-transcript library fallback
- * 3. ytdl audio download → OpenAI Whisper STT (fallback when captions are unavailable)
+ * 3. ytdl audio download → OpenAI Whisper STT (requires openai client; skipped when null)
+ *
+ * Pass `openai: null` in --extract-only mode when no API key is available.
+ * Whisper fallback is skipped and E_TRANSCRIPT_UNAVAILABLE is thrown instead.
  */
 export async function fetchTranscript(
   videoId: string,
-  openai: OpenAI
+  openai: OpenAI | null
 ): Promise<TranscriptSegment[]> {
   try {
     console.log('Fetching transcript via YouTube captions (Android client)...');
@@ -115,6 +119,14 @@ export async function fetchTranscript(
     throw new Error('youtube-transcript fallback returned an empty transcript.');
   } catch (fallbackErr) {
     console.warn(`youtube-transcript fallback unavailable: ${String(fallbackErr)}`);
+  }
+
+  if (!openai) {
+    throw new AppError(
+      'E_TRANSCRIPT_UNAVAILABLE',
+      'No captions found for this video. Whisper STT fallback requires OPENAI_API_KEY.\n' +
+        'Set OPENAI_API_KEY or use a video with captions enabled.'
+    );
   }
 
   console.warn('Falling back to Whisper STT (this may take a while)...');
