@@ -3,6 +3,8 @@
 [![npm version](https://img.shields.io/npm/v/youtube2md)](https://www.npmjs.com/package/youtube2md)
 [![npm downloads](https://img.shields.io/npm/dm/youtube2md)](https://www.npmjs.com/package/youtube2md)
 
+> Also available as a skill: [youtube-summary on ClawhHub](https://clawhub.ai/sunghyo/youtube-summary)
+
 Convert any YouTube video into a structured Markdown summary — with chapter detection, clickable timestamp links, and key takeaways.
 
 Two modes:
