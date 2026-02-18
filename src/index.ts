@@ -17,7 +17,7 @@ import type { SummaryData } from './types.js';
 
 async function main(): Promise<void> {
   // Step 1: Parse and validate CLI arguments
-  const { url, out } = parseCli();
+  const { url, out, lang } = parseCli();
 
   // Step 2: Validate environment
   const apiKey = process.env['OPENAI_API_KEY'];
@@ -78,7 +78,13 @@ async function main(): Promise<void> {
   // Step 6: Summarize with GPT
   let gptResult: Awaited<ReturnType<typeof summarizeWithGpt>>;
   try {
-    gptResult = await summarizeWithGpt(openai, segments, metadata, model);
+    if (lang) {
+      console.log(`Summary language override: ${lang}`);
+    } else {
+      console.log('Summary language: same as transcript');
+    }
+
+    gptResult = await summarizeWithGpt(openai, segments, metadata, model, lang);
     console.log(`GPT summary complete: ${gptResult.chapters.length} chapters detected.`);
   } catch (err) {
     console.error(`Error during GPT summarization: ${String(err)}`);

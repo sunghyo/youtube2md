@@ -222,7 +222,21 @@ function formatNativeChaptersSection(
     .join('\n')}`;
 }
 
-function buildSinglePassSystemPrompt(targets: OutputTargets): string {
+function buildOutputLanguageRules(summaryLanguage?: string): string {
+  if (!summaryLanguage) {
+    return '- Write all text fields (summary, chapter titles, chapter descriptions, takeaways) in the same language as the transcript';
+  }
+
+  return (
+    `- Write all text fields (summary, chapter titles, chapter descriptions, takeaways) in ${summaryLanguage}\n` +
+    `- If the transcript is in another language, translate faithfully into ${summaryLanguage}`
+  );
+}
+
+function buildSinglePassSystemPrompt(
+  targets: OutputTargets,
+  summaryLanguage?: string
+): string {
   return `You are an expert video content analyst. Your job is to read YouTube video transcripts and produce structured, accurate notes.
 
 You will receive a transcript with timestamps in [MM:SS] format, optional native chapter markers, and video metadata.
@@ -254,7 +268,7 @@ Rules:
 - Each chapter must include 2 to 4 entries in "descriptions"
 - Produce between ${targets.takeawayCount} takeaways
 - Summary length target: ${targets.summarySentences} sentences
-- Write all text fields (summary, chapter titles, chapter descriptions, takeaways) in the same language as the transcript
+${buildOutputLanguageRules(summaryLanguage)}
 - Do not include any text outside the JSON object`;
 }
 
@@ -275,7 +289,7 @@ ${transcriptText}
 Analyze the above transcript and produce the JSON summary.`;
 }
 
-function buildChunkSystemPrompt(): string {
+function buildChunkSystemPrompt(summaryLanguage?: string): string {
   return `You are an expert video content analyst. You are summarizing one chunk from a longer YouTube transcript.
 
 You MUST respond with ONLY a valid JSON object — no markdown code blocks, no explanation text, no preamble.
@@ -305,7 +319,7 @@ Rules:
 - Produce between 2 and 5 takeaways
 - Summary length target: 3-5 sentences
 - timestamps must be actual times from the transcript (do not invent times)
-- Write all text fields in the same language as the transcript
+${buildOutputLanguageRules(summaryLanguage)}
 - Do not include any text outside the JSON object`;
 }
 
@@ -338,7 +352,10 @@ ${chunk.text}
 Analyze ONLY this chunk and produce the JSON summary.`;
 }
 
-function buildFinalSynthesisSystemPrompt(targets: OutputTargets): string {
+function buildFinalSynthesisSystemPrompt(
+  targets: OutputTargets,
+  summaryLanguage?: string
+): string {
   return `You are an expert editor synthesizing chunk-level transcript summaries of one YouTube video into a final global summary and key takeaways.
 
 You MUST respond with ONLY a valid JSON object — no markdown code blocks, no explanation text, no preamble.
@@ -358,7 +375,7 @@ Rules:
 - Write a global full-video summary, not per-chunk summaries
 - Summary length target: ${targets.summarySentences} sentences
 - Produce between ${targets.takeawayCount} takeaways
-- Write summary and takeaways in the same language as the transcript
+${buildOutputLanguageRules(summaryLanguage)}
 - Do not include any text outside the JSON object`;
 }
 
@@ -470,17 +487,21 @@ async function requestFinalSynthesis(
  * @param openai   - Initialized OpenAI client
  * @param segments - Normalized transcript segments
  * @param metadata - Video metadata including native chapters
- * @param model    - GPT model ID (default: gpt-4o-mini)
+ * @param model    - GPT model ID (default: gpt-5-mini)
+ * @param summaryLanguage - Optional output language override
  */
 export async function summarizeWithGpt(
   openai: OpenAI,
   segments: TranscriptSegment[],
   metadata: VideoMetadata,
-  model: string = 'gpt-5-mini'
+  model: string = 'gpt-5-mini',
+  summaryLanguage?: string
 ): Promise<GptSummaryResponse> {
   if (segments.length === 0) {
     throw new Error('Cannot summarize an empty transcript.');
   }
+
+  const normalizedSummaryLanguage = summaryLanguage?.trim() || undefined;
 
   const tokenCache: TokenCountCache = new Map();
   const transcriptText = buildTranscriptText(segments);
@@ -500,7 +521,7 @@ export async function summarizeWithGpt(
       openai,
       model,
       'single-pass summarization',
-      buildSinglePassSystemPrompt(targets),
+      buildSinglePassSystemPrompt(targets, normalizedSummaryLanguage),
       buildSinglePassUserPrompt(metadata, transcriptText)
     );
   }
@@ -526,7 +547,7 @@ export async function summarizeWithGpt(
       openai,
       model,
       `chunk ${chunk.index + 1}/${chunks.length}`,
-      buildChunkSystemPrompt(),
+      buildChunkSystemPrompt(normalizedSummaryLanguage),
       buildChunkUserPrompt(metadata, chunk, chunks.length)
     );
 
@@ -546,7 +567,7 @@ export async function summarizeWithGpt(
     openai,
     model,
     'chunk-final synthesis',
-    buildFinalSynthesisSystemPrompt(targets),
+    buildFinalSynthesisSystemPrompt(targets, normalizedSummaryLanguage),
     buildFinalSynthesisUserPrompt(metadata, chunkSummaries)
   );
 

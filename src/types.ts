@@ -73,4 +73,5 @@ export interface SummaryData {
 export interface CliOptions {
   url: string;
   out?: string;
+  lang?: string;
 }

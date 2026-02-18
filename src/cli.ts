@@ -14,6 +14,10 @@ export function parseCli(): CliOptions {
     .version('1.0.0')
     .requiredOption('--url <youtube_url>', 'YouTube video URL to summarize')
     .option(
+      '--lang <language>',
+      'Summary output language (default: same as transcript language)'
+    )
+    .option(
       '--out <path>',
       'Output file path (default: ./summaries/<video_id>.md)'
     )
@@ -23,12 +27,13 @@ export function parseCli(): CliOptions {
 Examples:
   $ youtube2md --url https://www.youtube.com/watch?v=dQw4w9WgXcQ
   $ youtube2md --url https://youtu.be/dQw4w9WgXcQ --out ./notes/video.md
+  $ youtube2md --url https://youtu.be/dQw4w9WgXcQ --lang English
     `
     );
 
   program.parse(process.argv);
 
-  const opts = program.opts<{ url: string; out?: string }>();
+  const opts = program.opts<{ url: string; out?: string; lang?: string }>();
 
   if (!isYouTubeUrl(opts.url)) {
     console.error(
@@ -39,7 +44,13 @@ Examples:
     process.exit(1);
   }
 
-  return { url: opts.url, out: opts.out };
+  const language = opts.lang?.replace(/\s+/g, ' ').trim();
+
+  return {
+    url: opts.url,
+    out: opts.out,
+    lang: language && language.length > 0 ? language : undefined,
+  };
 }
 
 function isYouTubeUrl(url: string): boolean {

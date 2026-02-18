@@ -65,6 +65,9 @@ node dist/index.js --url https://www.youtube.com/watch?v=VIDEO_ID
 
 # With custom output path
 node dist/index.js --url https://youtu.be/VIDEO_ID --out ./notes/video.md
+
+# Set summary language
+node dist/index.js --url https://youtu.be/VIDEO_ID --lang Korean
 ```
 
 Output is saved to `./summaries/<video_id>.md` by default.
@@ -74,6 +77,7 @@ Output is saved to `./summaries/<video_id>.md` by default.
 | Option | Description |
 |---|---|
 | `--url <youtube_url>` | YouTube video URL (required) |
+| `--lang <language>` | Summary output language (default: same as transcript language) |
 | `--out <path>` | Output file path (default: `./summaries/<video_id>.md`) |
 | `--help` | Show help |
 | `--version` | Show version |
