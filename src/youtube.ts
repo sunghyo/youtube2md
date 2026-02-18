@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import type OpenAI from 'openai';
+import { YoutubeTranscript } from 'youtube-transcript';
 import type { VideoMetadata, TranscriptSegment, NativeChapter } from './types.js';
 
 // ─── URL Parsing ──────────────────────────────────────────────────────────────
@@ -75,10 +76,20 @@ export async function fetchVideoMetadata(videoId: string): Promise<VideoMetadata
 
 // ─── Transcript Fetching ───────────────────────────────────────────────────────
 
+const YOUTUBE_UA =
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/85.0.4183.83 Safari/537.36';
+
+interface CaptionTrack {
+  baseUrl: string;
+  languageCode: string;
+  kind?: string;
+}
+
 /**
- * Fetches a transcript using two strategies in order:
- * 1. Android Innertube client → caption XML (works for all languages including auto-generated)
- * 2. ytdl audio download → OpenAI Whisper STT (fallback when no captions exist)
+ * Fetches a transcript using three strategies in order:
+ * 1. Android Innertube client captions (supports JSON3 + XML timedtext formats)
+ * 2. youtube-transcript library fallback
+ * 3. ytdl audio download → OpenAI Whisper STT (fallback when captions are unavailable)
  */
 export async function fetchTranscript(
   videoId: string,
@@ -95,6 +106,17 @@ export async function fetchTranscript(
     console.warn(`YouTube captions unavailable: ${String(captionErr)}`);
   }
 
+  try {
+    console.log('Retrying transcript via youtube-transcript fallback...');
+    const segments = await fetchTranscriptViaYoutubeTranscript(videoId);
+    if (segments.length > 0) {
+      return segments;
+    }
+    throw new Error('youtube-transcript fallback returned an empty transcript.');
+  } catch (fallbackErr) {
+    console.warn(`youtube-transcript fallback unavailable: ${String(fallbackErr)}`);
+  }
+
   console.warn('Falling back to Whisper STT (this may take a while)...');
   return fetchTranscriptViaWhisper(videoId, openai);
 }
@@ -102,14 +124,12 @@ export async function fetchTranscript(
 /**
  * Fetches captions using YouTube's Android Innertube client.
  * The Android context returns working caption URLs unlike the web page scraping approach.
- * Parses the timedtext XML format (format="3") with <p t="ms" d="ms"> elements.
+ * Supports multiple timedtext payloads (json3, srv3 XML with <p>, and XML with <text>).
  */
 async function fetchTranscriptViaInnertube(videoId: string): Promise<TranscriptSegment[]> {
-  const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/85.0.4183.83 Safari/537.36';
-
   // Get the InnerTube API key from the video page
   const html = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
-    headers: { 'User-Agent': UA },
+    headers: { 'User-Agent': YOUTUBE_UA },
   }).then((r) => r.text());
 
   const apiKeyMatch = html.match(/"INNERTUBE_API_KEY":"([^"]+)"/);
@@ -121,7 +141,7 @@ async function fetchTranscriptViaInnertube(videoId: string): Promise<TranscriptS
   // Call the player endpoint with Android client — returns working caption URLs
   const playerRes = await fetch(`https://www.youtube.com/youtubei/v1/player?key=${apiKey}`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'User-Agent': UA },
+    headers: { 'Content-Type': 'application/json', 'User-Agent': YOUTUBE_UA },
     body: JSON.stringify({
       context: {
         client: {
@@ -134,10 +154,14 @@ async function fetchTranscriptViaInnertube(videoId: string): Promise<TranscriptS
     }),
   });
 
+  if (!playerRes.ok) {
+    throw new Error(`InnerTube player request failed: HTTP ${playerRes.status}`);
+  }
+
   const player = await playerRes.json() as {
     captions?: {
       playerCaptionsTracklistRenderer?: {
-        captionTracks?: Array<{ baseUrl: string; languageCode: string }>;
+        captionTracks?: CaptionTrack[];
       };
     };
   };
@@ -148,50 +172,278 @@ async function fetchTranscriptViaInnertube(videoId: string): Promise<TranscriptS
   }
 
   console.log(`Found caption tracks: ${tracks.map((t) => t.languageCode).join(', ')}`);
+  const sortedTracks = [...tracks].sort((a, b) => captionTrackRank(a) - captionTrackRank(b));
 
-  const captionRes = await fetch(tracks[0].baseUrl, { headers: { 'User-Agent': UA } });
-  if (!captionRes.ok) {
-    throw new Error(`Caption fetch failed: HTTP ${captionRes.status}`);
+  const failures: string[] = [];
+  for (const track of sortedTracks) {
+    try {
+      const segments = await fetchCaptionTrack(track);
+      if (segments.length > 0) {
+        return segments;
+      }
+      failures.push(`${track.languageCode}: empty transcript`);
+    } catch (err) {
+      failures.push(`${track.languageCode}: ${String(err)}`);
+    }
   }
-  const xml = await captionRes.text();
 
-  return parseTimedTextXml(xml);
+  throw new Error(
+    `All caption tracks failed to parse.\n` +
+      failures.map((entry) => `  - ${entry}`).join('\n')
+  );
 }
 
 /**
- * Parses YouTube's timedtext XML format (format="3").
- * Each <p t="START_MS" d="DURATION_MS"> contains <s> word elements.
- * Groups consecutive <s> words into a single segment per <p>.
+ * Fallback caption fetcher using the youtube-transcript package.
+ */
+async function fetchTranscriptViaYoutubeTranscript(videoId: string): Promise<TranscriptSegment[]> {
+  const transcript = await YoutubeTranscript.fetchTranscript(videoId);
+  const segments = transcript
+    .map((seg) => ({
+      text: normalizeTranscriptText(decodeHtmlEntities(seg.text)),
+      startSeconds: Math.max(0, seg.offset),
+      durationSeconds: Math.max(0, seg.duration),
+    }))
+    .filter((seg) => seg.text !== '');
+
+  if (segments.length === 0) {
+    throw new Error('No transcript segments returned by youtube-transcript.');
+  }
+
+  return segments;
+}
+
+async function fetchCaptionTrack(track: CaptionTrack): Promise<TranscriptSegment[]> {
+  const attempts: Array<{ url: string; parse: (body: string) => TranscriptSegment[] }> = [];
+  const json3Url = new URL(track.baseUrl);
+  json3Url.searchParams.set('fmt', 'json3');
+  attempts.push({ url: json3Url.toString(), parse: parseCaptionJson3 });
+  attempts.push({ url: track.baseUrl, parse: parseTimedTextXml });
+  const srv3Url = new URL(track.baseUrl);
+  srv3Url.searchParams.set('fmt', 'srv3');
+  attempts.push({ url: srv3Url.toString(), parse: parseTimedTextXml });
+
+  const seenUrls = new Set<string>();
+  for (const attempt of attempts) {
+    if (seenUrls.has(attempt.url)) {
+      continue;
+    }
+    seenUrls.add(attempt.url);
+
+    const captionRes = await fetch(attempt.url, { headers: { 'User-Agent': YOUTUBE_UA } });
+    if (!captionRes.ok) {
+      continue;
+    }
+    const body = await captionRes.text();
+    const segments = attempt.parse(body);
+    if (segments.length > 0) {
+      return segments;
+    }
+  }
+
+  throw new Error('No parsable transcript segments found.');
+}
+
+function captionTrackRank(track: CaptionTrack): number {
+  // Prefer manually-authored captions over auto-generated tracks.
+  return track.kind === 'asr' ? 1 : 0;
+}
+
+/**
+ * Parses YouTube json3 timedtext payloads.
+ */
+function parseCaptionJson3(payload: string): TranscriptSegment[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(payload);
+  } catch {
+    return [];
+  }
+
+  if (typeof parsed !== 'object' || parsed === null) {
+    return [];
+  }
+
+  const events = (parsed as { events?: unknown }).events;
+  if (!Array.isArray(events)) {
+    return [];
+  }
+
+  const segments: TranscriptSegment[] = [];
+  for (const event of events) {
+    if (typeof event !== 'object' || event === null) {
+      continue;
+    }
+
+    const entry = event as {
+      tStartMs?: unknown;
+      dDurationMs?: unknown;
+      segs?: unknown;
+    };
+    const startMs = typeof entry.tStartMs === 'number' ? entry.tStartMs : undefined;
+    const durationMs = typeof entry.dDurationMs === 'number' ? entry.dDurationMs : 0;
+    if (startMs === undefined || !Array.isArray(entry.segs)) {
+      continue;
+    }
+
+    const rawText = entry.segs
+      .map((seg) => {
+        if (typeof seg !== 'object' || seg === null) {
+          return '';
+        }
+        const utf8 = (seg as { utf8?: unknown }).utf8;
+        return typeof utf8 === 'string' ? utf8 : '';
+      })
+      .join('');
+
+    const text = normalizeTranscriptText(decodeHtmlEntities(rawText));
+    if (text === '') {
+      continue;
+    }
+
+    segments.push({
+      text,
+      startSeconds: Math.max(0, startMs / 1000),
+      durationSeconds: Math.max(0, durationMs / 1000),
+    });
+  }
+
+  return segments;
+}
+
+/**
+ * Parses YouTube timedtext XML formats:
+ * - srv3 style: <p t="ms" d="ms">...</p>
+ * - legacy style: <text start="seconds" dur="seconds">...</text>
  */
 function parseTimedTextXml(xml: string): TranscriptSegment[] {
+  const paragraphSegments = parseTimedTextElements(xml, {
+    tag: 'p',
+    startAttr: 't',
+    durationAttr: 'd',
+    unitScale: 1000,
+  });
+  if (paragraphSegments.length > 0) {
+    return paragraphSegments;
+  }
+
+  return parseTimedTextElements(xml, {
+    tag: 'text',
+    startAttr: 'start',
+    durationAttr: 'dur',
+    unitScale: 1,
+  });
+}
+
+function parseTimedTextElements(
+  xml: string,
+  config: {
+    tag: 'p' | 'text';
+    startAttr: string;
+    durationAttr: string;
+    unitScale: number;
+  }
+): TranscriptSegment[] {
   const segments: TranscriptSegment[] = [];
-  const paragraphRegex = /<p t="(\d+)" d="(\d+)"[^>]*>([\s\S]*?)<\/p>/g;
-  const wordRegex = /<s[^>]*>([^<]*)<\/s>/g;
+  const elementRegex = new RegExp(`<${config.tag}\\b([^>]*)>([\\s\\S]*?)<\\/${config.tag}>`, 'g');
 
   let match: RegExpExecArray | null;
-  while ((match = paragraphRegex.exec(xml)) !== null) {
-    const startMs = parseInt(match[1], 10);
-    const durationMs = parseInt(match[2], 10);
-    const inner = match[3];
-
-    // Concatenate all <s> word segments within this paragraph
-    const words: string[] = [];
-    let wordMatch: RegExpExecArray | null;
-    while ((wordMatch = wordRegex.exec(inner)) !== null) {
-      words.push(wordMatch[1]);
+  while ((match = elementRegex.exec(xml)) !== null) {
+    const attrs = match[1];
+    const inner = match[2];
+    const startRaw = getXmlAttribute(attrs, config.startAttr);
+    const durationRaw = getXmlAttribute(attrs, config.durationAttr);
+    if (!startRaw || !durationRaw) {
+      continue;
     }
-    const text = words.join('').trim();
+
+    const start = Number(startRaw);
+    const duration = Number(durationRaw);
+    if (!Number.isFinite(start) || !Number.isFinite(duration)) {
+      continue;
+    }
+
+    const text = extractXmlCaptionText(inner);
 
     if (text.length > 0) {
       segments.push({
         text,
-        startSeconds: startMs / 1000,
-        durationSeconds: durationMs / 1000,
+        startSeconds: Math.max(0, start / config.unitScale),
+        durationSeconds: Math.max(0, duration / config.unitScale),
       });
     }
   }
 
   return segments;
+}
+
+function getXmlAttribute(attrs: string, attrName: string): string | undefined {
+  const escapedName = attrName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const match = attrs.match(new RegExp(`${escapedName}="([^"]+)"`));
+  return match?.[1];
+}
+
+function extractXmlCaptionText(inner: string): string {
+  const wordRegex = /<s[^>]*>([\s\S]*?)<\/s>/g;
+  const words: string[] = [];
+  let wordMatch: RegExpExecArray | null;
+  while ((wordMatch = wordRegex.exec(inner)) !== null) {
+    words.push(wordMatch[1]);
+  }
+
+  const rawText = words.length > 0 ? words.join('') : inner;
+  const withoutTags = rawText.replace(/<[^>]+>/g, '');
+  return normalizeTranscriptText(decodeHtmlEntities(withoutTags));
+}
+
+function decodeHtmlEntities(input: string): string {
+  return input.replace(/&(#\d+|#x[0-9a-fA-F]+|[a-zA-Z]+);/g, (full, entity: string) => {
+    if (entity.startsWith('#x') || entity.startsWith('#X')) {
+      const codePoint = Number.parseInt(entity.slice(2), 16);
+      if (Number.isFinite(codePoint)) {
+        try {
+          return String.fromCodePoint(codePoint);
+        } catch {
+          return full;
+        }
+      }
+      return full;
+    }
+
+    if (entity.startsWith('#')) {
+      const codePoint = Number.parseInt(entity.slice(1), 10);
+      if (Number.isFinite(codePoint)) {
+        try {
+          return String.fromCodePoint(codePoint);
+        } catch {
+          return full;
+        }
+      }
+      return full;
+    }
+
+    switch (entity.toLowerCase()) {
+      case 'amp':
+        return '&';
+      case 'lt':
+        return '<';
+      case 'gt':
+        return '>';
+      case 'quot':
+        return '"';
+      case 'apos':
+      case '#39':
+        return '\'';
+      case 'nbsp':
+        return ' ';
+      default:
+        return full;
+    }
+  });
+}
+
+function normalizeTranscriptText(text: string): string {
+  return text.replace(/\s+/g, ' ').trim();
 }
 
 /**

@@ -2,7 +2,73 @@
 
 Convert any YouTube video into a structured Markdown summary — with chapter detection, clickable timestamp links, and key takeaways.
 
-## Output
+## Install
+
+```bash
+npm install -g youtube2md
+```
+
+Or use without installing:
+
+```bash
+OPENAI_API_KEY=sk-... npx youtube2md --url https://youtu.be/VIDEO_ID
+```
+
+## Usage
+
+```bash
+# Basic usage
+youtube2md --url https://www.youtube.com/watch?v=VIDEO_ID
+
+# With custom output path
+youtube2md --url https://youtu.be/VIDEO_ID --out ./notes/video.md
+
+# Set summary language
+youtube2md --url https://youtu.be/VIDEO_ID --lang Korean
+
+# Use a specific model
+youtube2md --url https://youtu.be/VIDEO_ID --model gpt-4o-mini
+```
+
+Output is saved to `./summaries/<video_id>.md` by default.
+
+### Options
+
+| Option | Description |
+|---|---|
+| `--url <youtube_url>` | YouTube video URL (required) |
+| `--model <model>` | OpenAI model to use (default: `gpt-5-mini`). Overrides `OPENAI_MODEL` env var. |
+| `--lang <language>` | Summary output language (default: same as transcript language) |
+| `--out <path>` | Output file path (default: `./summaries/<video_id>.md`). Use `--out ./<video_id>.md` to save in the current directory. |
+| `--help` | Show help |
+| `--version` | Show version |
+
+## Requirements
+
+- Node.js 18+
+- OpenAI API key with access to GPT-4/5 models
+
+## Environment variables
+
+| Variable | Description |
+|---|---|
+| `OPENAI_API_KEY` | Required. Your OpenAI API key. |
+| `OPENAI_MODEL` | Optional. Fallback model if `--model` is not passed (default: `gpt-5-mini`). |
+
+Set your API key before running:
+
+```bash
+export OPENAI_API_KEY=sk-...
+youtube2md --url https://youtu.be/VIDEO_ID
+```
+
+Or create a `.env` file in your working directory:
+
+```
+OPENAI_API_KEY=sk-...
+```
+
+## Output format
 
 ```markdown
 # Video Title
@@ -35,77 +101,13 @@ One paragraph overview of the video content.
 - Key point 2
 ```
 
-## Requirements
-
-- Node.js 18+
-- OpenAI API key with access to GPT-5 models
-
-## Setup
-
-```bash
-# 1. Clone and install
-git clone <repo>
-cd youtube2md
-npm install
-
-# 2. Set your API key
-cp .env.example .env
-# Edit .env and add your OPENAI_API_KEY
-```
-
-## Usage
-
-```bash
-# Development
-npx tsx src/index.ts --url https://www.youtube.com/watch?v=VIDEO_ID
-
-# After build
-npm run build
-node dist/index.js --url https://www.youtube.com/watch?v=VIDEO_ID
-
-# With custom output path
-node dist/index.js --url https://youtu.be/VIDEO_ID --out ./notes/video.md
-
-# Set summary language
-node dist/index.js --url https://youtu.be/VIDEO_ID --lang Korean
-
-# Use a specific model
-node dist/index.js --url https://youtu.be/VIDEO_ID --model gpt-5-mini
-```
-
-Output is saved to `./summaries/<video_id>.md` by default.
-
-### Options
-
-| Option | Description |
-|---|---|
-| `--url <youtube_url>` | YouTube video URL (required) |
-| `--model <model>` | OpenAI model to use (default: `gpt-5-mini`). Overrides `OPENAI_MODEL` env var. |
-| `--lang <language>` | Summary output language (default: same as transcript language) |
-| `--out <path>` | Output file path (default: `./summaries/<video_id>.md`). Use `--out ./<video_id>.md` to save in the current directory. |
-| `--help` | Show help |
-| `--version` | Show version |
-
-### Global install
-
-```bash
-npm install -g .
-youtube2md --url https://youtu.be/VIDEO_ID
-```
-
-## Environment variables
-
-| Variable | Description |
-|---|---|
-| `OPENAI_API_KEY` | Required. Your OpenAI API key. |
-| `OPENAI_MODEL` | Optional. Fallback model if `--model` is not passed (default: `gpt-5-mini`). |
-
 ## Transcript strategy
 
 The tool tries these methods in order:
 
-1. **YouTube captions via Android Innertube** — uses YouTube caption tracks when available (official or auto-generated)
-2. **OpenAI Whisper STT fallback** — downloads audio and transcribes it when captions are unavailable (requires API quota; audio must be under 25 MB)
+1. **YouTube captions via Android Innertube** — uses caption tracks from YouTube directly (supports `json3` and XML timedtext formats)
+2. **`youtube-transcript` fallback** — retries transcript extraction with an alternate parser path
+3. **OpenAI Whisper STT fallback** — downloads audio and transcribes it when captions are unavailable (requires API quota; audio must be under 25 MB)
 
 ## Summary process
 
@@ -145,7 +147,33 @@ These constants are defined in `src/summarizer.ts`:
   - If the final chunk is smaller than `25%` of `CHUNK_TOKEN_LIMIT`, it is merged into the previous chunk.
   - This avoids a tiny final chunk that usually lowers summary quality.
 
-## Project structure
+---
+
+## Development
+
+```bash
+# Clone and install
+git clone https://github.com/sunghyo/youtube2md
+cd youtube2md
+npm install
+
+# Set your API key
+cp .env.example .env
+# Edit .env and add your OPENAI_API_KEY
+
+# Run without building
+npx tsx src/index.ts --url https://www.youtube.com/watch?v=VIDEO_ID
+```
+
+### Build
+
+```bash
+npm run build   # Compile TypeScript to dist/
+npm run dev     # Run directly with tsx (no build needed)
+npm run clean   # Remove dist/
+```
+
+### Project structure
 
 ```
 src/
@@ -158,14 +186,6 @@ src/
 summaries/         # Default output directory
 ```
 
-## Build
-
-```bash
-npm run build   # Compile TypeScript to dist/
-npm run dev     # Run directly with tsx (no build needed)
-npm run clean   # Remove dist/
-```
-
 ## Attribution
 
-This project was built with AI assistance. This project was generated with AI assistance from [Claude](https://claude.ai) (Anthropic) and [Codex](https://openai.com/blog/openai-codex) (OpenAI).
+This project was built with AI assistance from [Claude](https://claude.ai) (Anthropic) and [Codex](https://openai.com/blog/openai-codex) (OpenAI).

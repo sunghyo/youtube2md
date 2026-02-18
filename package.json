@@ -8,11 +8,20 @@
     "youtube2md": "./dist/index.js"
   },
   "type": "module",
+  "license": "MIT",
+  "author": "sunghyo",
+  "keywords": ["youtube", "markdown", "summary", "transcript", "openai", "gpt"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sunghyo/youtube2md"
+  },
+  "homepage": "https://github.com/sunghyo/youtube2md#readme",
   "scripts": {
     "build": "tsc && chmod +x dist/index.js",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js",
-    "clean": "rm -rf dist"
+    "clean": "rm -rf dist",
+    "prepublishOnly": "npm run build"
   },
   "dependencies": {
     "@distube/ytdl-core": "^4.14.4",

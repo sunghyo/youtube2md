@@ -3,11 +3,25 @@
 // dotenv/config must be imported first so env vars are loaded before anything reads them
 import 'dotenv/config';
 import { mkdirSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
-// Redirect ytdl-core debug files (player-script.js) to a cache directory
-const ytdlCacheDir = '.cache/ytdl';
-mkdirSync(ytdlCacheDir, { recursive: true });
-process.env['YTDL_DEBUG_PATH'] ??= ytdlCacheDir;
+function configureYtdlDebugPath(): void {
+  if (process.env['YTDL_DEBUG_PATH']) {
+    return;
+  }
+
+  // Avoid writing into cwd so --help/--version work from read-only directories.
+  const ytdlCacheDir = path.join(os.tmpdir(), 'youtube2md', 'ytdl');
+  try {
+    mkdirSync(ytdlCacheDir, { recursive: true });
+    process.env['YTDL_DEBUG_PATH'] = ytdlCacheDir;
+  } catch {
+    // Best-effort only. Continue without custom debug path.
+  }
+}
+
+configureYtdlDebugPath();
 import OpenAI from 'openai';
 import { parseCli } from './cli.js';
 import { extractVideoId, fetchVideoMetadata, fetchTranscript } from './youtube.js';
