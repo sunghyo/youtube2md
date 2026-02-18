@@ -17,7 +17,7 @@ import type { SummaryData } from './types.js';
 
 async function main(): Promise<void> {
   // Step 1: Parse and validate CLI arguments
-  const { url, out, lang } = parseCli();
+  const { url, out, lang, model: cliModel } = parseCli();
 
   // Step 2: Validate environment
   const apiKey = process.env['OPENAI_API_KEY'];
@@ -31,7 +31,7 @@ async function main(): Promise<void> {
   }
 
   const openai = new OpenAI({ apiKey });
-  const model = process.env['OPENAI_MODEL'] ?? 'gpt-5-mini';
+  const model = cliModel ?? process.env['OPENAI_MODEL'] ?? 'gpt-5-mini';
 
   // Step 3: Extract video ID
   let videoId: string;

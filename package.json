@@ -2,6 +2,7 @@
   "name": "youtube2md",
   "version": "1.0.0",
   "description": "Convert a YouTube video to a Markdown summary file",
+  "files": ["dist"],
   "main": "dist/index.js",
   "bin": {
     "youtube2md": "./dist/index.js"

@@ -74,4 +74,5 @@ export interface CliOptions {
   url: string;
   out?: string;
   lang?: string;
+  model?: string;
 }

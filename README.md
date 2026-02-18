@@ -68,6 +68,9 @@ node dist/index.js --url https://youtu.be/VIDEO_ID --out ./notes/video.md
 
 # Set summary language
 node dist/index.js --url https://youtu.be/VIDEO_ID --lang Korean
+
+# Use a specific model
+node dist/index.js --url https://youtu.be/VIDEO_ID --model gpt-5-mini
 ```
 
 Output is saved to `./summaries/<video_id>.md` by default.
@@ -77,8 +80,9 @@ Output is saved to `./summaries/<video_id>.md` by default.
 | Option | Description |
 |---|---|
 | `--url <youtube_url>` | YouTube video URL (required) |
+| `--model <model>` | OpenAI model to use (default: `gpt-5-mini`). Overrides `OPENAI_MODEL` env var. |
 | `--lang <language>` | Summary output language (default: same as transcript language) |
-| `--out <path>` | Output file path (default: `./summaries/<video_id>.md`) |
+| `--out <path>` | Output file path (default: `./summaries/<video_id>.md`). Use `--out ./<video_id>.md` to save in the current directory. |
 | `--help` | Show help |
 | `--version` | Show version |
 
@@ -94,7 +98,7 @@ youtube2md --url https://youtu.be/VIDEO_ID
 | Variable | Description |
 |---|---|
 | `OPENAI_API_KEY` | Required. Your OpenAI API key. |
-| `OPENAI_MODEL` | Optional. Override the model (default: `gpt-5-mini`). |
+| `OPENAI_MODEL` | Optional. Fallback model if `--model` is not passed (default: `gpt-5-mini`). |
 
 ## Transcript strategy
 

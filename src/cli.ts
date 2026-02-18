@@ -1,5 +1,9 @@
+import { createRequire } from 'node:module';
 import { Command } from 'commander';
 import type { CliOptions } from './types.js';
+
+const require = createRequire(import.meta.url);
+const { version } = require('../package.json') as { version: string };
 
 /**
  * Parses process.argv and returns validated CLI options.
@@ -11,11 +15,15 @@ export function parseCli(): CliOptions {
   program
     .name('youtube2md')
     .description('Convert a YouTube video to a Markdown summary file')
-    .version('1.0.0')
+    .version(version)
     .requiredOption('--url <youtube_url>', 'YouTube video URL to summarize')
     .option(
       '--lang <language>',
       'Summary output language (default: same as transcript language)'
+    )
+    .option(
+      '--model <model>',
+      'OpenAI model to use (default: gpt-5-mini)'
     )
     .option(
       '--out <path>',
@@ -27,13 +35,14 @@ export function parseCli(): CliOptions {
 Examples:
   $ youtube2md --url https://www.youtube.com/watch?v=dQw4w9WgXcQ
   $ youtube2md --url https://youtu.be/dQw4w9WgXcQ --out ./notes/video.md
+  $ youtube2md --url https://youtu.be/dQw4w9WgXcQ --out ./dQw4w9WgXcQ.md
   $ youtube2md --url https://youtu.be/dQw4w9WgXcQ --lang English
     `
     );
 
   program.parse(process.argv);
 
-  const opts = program.opts<{ url: string; out?: string; lang?: string }>();
+  const opts = program.opts<{ url: string; out?: string; lang?: string; model?: string }>();
 
   if (!isYouTubeUrl(opts.url)) {
     console.error(
@@ -50,6 +59,7 @@ Examples:
     url: opts.url,
     out: opts.out,
     lang: language && language.length > 0 ? language : undefined,
+    model: opts.model?.trim() || undefined,
   };
 }
 
