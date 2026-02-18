@@ -18,6 +18,8 @@ const SINGLE_PASS_TOKEN_LIMIT = 5_000;
 const CHUNK_TOKEN_LIMIT = 5_000;
 // If the final chunk is smaller than this ratio of CHUNK_TOKEN_LIMIT, merge it into the previous chunk.
 const MIN_LAST_CHUNK_RATIO = 0.25;
+// Maximum number of concurrent GPT jobs when summarizing transcript chunks.
+const MAX_CHUNK_SUMMARY_JOBS = 4;
 
 interface TranscriptChunk {
   index: number;
@@ -412,6 +414,69 @@ function combineChunkChapters(chunkSummaries: ChunkSummary[]): Chapter[] {
   return normalizeChapters(combinedChapters);
 }
 
+async function summarizeChunksWithConcurrency(
+  openai: OpenAI,
+  model: string,
+  metadata: VideoMetadata,
+  chunks: TranscriptChunk[],
+  summaryLanguage?: string
+): Promise<ChunkSummary[]> {
+  if (chunks.length === 0) {
+    return [];
+  }
+
+  const concurrency = Math.min(MAX_CHUNK_SUMMARY_JOBS, chunks.length);
+  const results: Array<ChunkSummary | undefined> = new Array(chunks.length);
+  let nextChunkIndex = 0;
+  let completedCount = 0;
+
+  console.log(`Chunk summarization parallelism: up to ${concurrency} concurrent job(s).`);
+
+  async function worker(): Promise<void> {
+    while (true) {
+      const currentIndex = nextChunkIndex;
+      if (currentIndex >= chunks.length) {
+        return;
+      }
+      nextChunkIndex += 1;
+
+      const chunk = chunks[currentIndex];
+      console.log(
+        `Summarizing chunk ${chunk.index + 1}/${chunks.length} ` +
+          `(${chunk.tokenLength} tokens, ` +
+          `${secondsToTimestamp(chunk.startSeconds)}-${secondsToTimestamp(chunk.endSeconds)})...`
+      );
+
+      const chunkResult = await requestStructuredSummary(
+        openai,
+        model,
+        `chunk ${chunk.index + 1}/${chunks.length}`,
+        buildChunkSystemPrompt(summaryLanguage),
+        buildChunkUserPrompt(metadata, chunk, chunks.length)
+      );
+
+      results[currentIndex] = {
+        chunkIndex: chunk.index,
+        startSeconds: chunk.startSeconds,
+        endSeconds: chunk.endSeconds,
+        result: chunkResult,
+      };
+
+      completedCount += 1;
+      console.log(`Completed chunk ${chunk.index + 1}/${chunks.length} (${completedCount}/${chunks.length}).`);
+    }
+  }
+
+  await Promise.all(Array.from({ length: concurrency }, () => worker()));
+
+  return results.map((item, idx) => {
+    if (!item) {
+      throw new Error(`Missing chunk summary result for chunk index ${idx}.`);
+    }
+    return item;
+  });
+}
+
 // ─── GPT Summarization ────────────────────────────────────────────────────────
 
 async function requestStructuredSummary(
@@ -534,30 +599,13 @@ export async function summarizeWithGpt(
       `(~${CHUNK_TOKEN_LIMIT} tokens each).`
   );
 
-  const chunkSummaries: ChunkSummary[] = [];
-
-  for (const chunk of chunks) {
-    console.log(
-      `Summarizing chunk ${chunk.index + 1}/${chunks.length} ` +
-        `(${chunk.tokenLength} tokens, ` +
-        `${secondsToTimestamp(chunk.startSeconds)}-${secondsToTimestamp(chunk.endSeconds)})...`
-    );
-
-    const chunkResult = await requestStructuredSummary(
-      openai,
-      model,
-      `chunk ${chunk.index + 1}/${chunks.length}`,
-      buildChunkSystemPrompt(normalizedSummaryLanguage),
-      buildChunkUserPrompt(metadata, chunk, chunks.length)
-    );
-
-    chunkSummaries.push({
-      chunkIndex: chunk.index,
-      startSeconds: chunk.startSeconds,
-      endSeconds: chunk.endSeconds,
-      result: chunkResult,
-    });
-  }
+  const chunkSummaries = await summarizeChunksWithConcurrency(
+    openai,
+    model,
+    metadata,
+    chunks,
+    normalizedSummaryLanguage
+  );
 
   console.log(`Combining ${chunkSummaries.length} chunk chapters without merge stage...`);
   const combinedChapters = combineChunkChapters(chunkSummaries);
