@@ -2,18 +2,27 @@
   "name": "youtube2md",
   "version": "1.0.1",
   "description": "Convert a YouTube video to a Markdown summary file",
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "main": "dist/index.js",
   "bin": {
-    "youtube2md": "./dist/index.js"
+    "youtube2md": "dist/index.js"
   },
   "type": "module",
   "license": "MIT",
   "author": "sunghyo",
-  "keywords": ["youtube", "markdown", "summary", "transcript", "openai", "gpt"],
+  "keywords": [
+    "youtube",
+    "markdown",
+    "summary",
+    "transcript",
+    "openai",
+    "gpt"
+  ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/sunghyo/youtube2md"
+    "url": "git+https://github.com/sunghyo/youtube2md.git"
   },
   "homepage": "https://github.com/sunghyo/youtube2md#readme",
   "scripts": {
