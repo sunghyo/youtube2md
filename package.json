@@ -1,6 +1,6 @@
 {
   "name": "youtube2md",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Convert a YouTube video to a Markdown summary file",
   "files": [
     "dist"
@@ -33,12 +33,12 @@
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
-    "@distube/ytdl-core": "^4.14.4",
+    "@distube/ytdl-core": "^4.15.9",
     "commander": "^12.1.0",
     "dotenv": "^16.4.5",
     "openai": "^5.0.0",
     "tiktoken": "^1.0.22",
-    "youtube-transcript": "^1.2.1"
+    "youtube-transcript": "^1.3.1"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

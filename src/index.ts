@@ -9,7 +9,9 @@ import path from 'node:path';
 // Pre-parse --json flag before full CLI parsing so early errors can be emitted as JSON
 let jsonMode = process.argv.includes('--json');
 
-function configureYtdlDebugPath(): void {
+function configureYtdlEnvironment(): void {
+  process.env['YTDL_NO_UPDATE'] ??= '1';
+
   if (process.env['YTDL_DEBUG_PATH']) {
     return;
   }
@@ -24,7 +26,7 @@ function configureYtdlDebugPath(): void {
   }
 }
 
-configureYtdlDebugPath();
+configureYtdlEnvironment();
 import OpenAI from 'openai';
 import { parseCli } from './cli.js';
 import { extractVideoId, fetchVideoMetadata, fetchTranscript } from './youtube.js';

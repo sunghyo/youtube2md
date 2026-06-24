@@ -45,6 +45,9 @@ youtube2md --url https://youtu.be/VIDEO_ID --model gpt-5-mini
 # Extract transcript only (no API key required if captions are available)
 youtube2md --url https://youtu.be/VIDEO_ID --extract-only
 
+# Use signed-in YouTube cookies when captions/audio need an authenticated session
+YOUTUBE_COOKIES_PATH=./cookies.youtube.json youtube2md --url https://youtu.be/VIDEO_ID --extract-only
+
 # Machine-readable JSON output from full pipeline
 youtube2md --url https://youtu.be/VIDEO_ID --json --stdout
 ```
@@ -77,6 +80,8 @@ Output is saved to `./summaries/<video_id>.md` (full pipeline) or `./summaries/<
 |---|---|
 | `OPENAI_API_KEY` | Required for summarization. Not needed in `--extract-only` mode if captions are available. |
 | `OPENAI_MODEL` | Optional. Fallback model if `--model` is not passed (default: `gpt-5-mini`). |
+| `YOUTUBE_COOKIES_PATH` | Optional. Path to an EditThisCookie JSON export for `youtube.com`. Used for metadata, captions, and audio fallback requests. |
+| `YOUTUBE_COOKIE_HEADER` | Optional. Raw `Cookie` header string for `youtube.com` requests. Useful when you already have a browser request cookie string. |
 
 Set your API key before running:
 
@@ -89,7 +94,10 @@ Or create a `.env` file in your working directory:
 
 ```
 OPENAI_API_KEY=sk-...
+# YOUTUBE_COOKIES_PATH=./cookies.youtube.json
 ```
+
+When YouTube exposes caption tracks but blocks the actual transcript or downloadable audio to anonymous requests, provide `YOUTUBE_COOKIES_PATH` or `YOUTUBE_COOKIE_HEADER` from a signed-in browser session.
 
 ## Output format
 
@@ -170,9 +178,9 @@ All errors emit a structured object when `--json` is active:
 
 The tool tries these methods in order:
 
-1. **YouTube captions via Android Innertube** — uses caption tracks directly (supports `json3` and XML timedtext formats)
+1. **YouTube captions via watch-page / InnerTube requests** — uses caption tracks directly and applies configured YouTube cookies when available (supports `json3` and XML timedtext formats)
 2. **`youtube-transcript` fallback** — retries with an alternate parser path
-3. **OpenAI Whisper STT fallback** — downloads audio and transcribes it (requires `OPENAI_API_KEY`; audio must be under 25 MB). Skipped in `--extract-only` mode when no API key is set.
+3. **OpenAI Whisper STT fallback** — downloads audio and transcribes it (requires `OPENAI_API_KEY`; audio must be under 25 MB). Cookie-backed requests are applied here too when configured. Skipped in `--extract-only` mode when no API key is set.
 
 ## Summary process
 
