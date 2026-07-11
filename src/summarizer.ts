@@ -20,14 +20,41 @@ const CHUNK_TOKEN_LIMIT = 5_000;
 const MIN_LAST_CHUNK_RATIO = 0.25;
 // Maximum number of concurrent GPT jobs when summarizing transcript chunks.
 const MAX_CHUNK_SUMMARY_JOBS = 4;
+// Once a chunk holds at least this fraction of the budget, close it at the next natural
+// boundary (native chapter start or speech pause) instead of running to the hard limit.
+const CHUNK_SOFT_FILL_RATIO = 0.6;
+// A silent gap of at least this many seconds between segments is treated as a topic break.
+const SPEECH_GAP_BREAK_SECONDS = 2.5;
+// Leading overlap carried into each chunk (context only, no chapters), as a fraction of the budget.
+const CHUNK_OVERLAP_RATIO = 0.12;
+// Cap the leading overlap window so short, dense chunks don't pull in a huge preamble.
+const MAX_OVERLAP_SECONDS = 60;
+// Chapters within this many seconds are treated as the same boundary and merged unconditionally.
+const CHAPTER_NEAR_SECONDS = 15;
+// Chapters within this window are merged only if their titles are also similar.
+const CHAPTER_MERGE_WINDOW_SECONDS = 45;
+// A description whose inline time marker falls outside its chapter's window by more
+// than this margin is relocated to the chapter that actually covers that time.
+const DESCRIPTION_REASSIGN_TOLERANCE_SECONDS = 20;
+// Total attempts (1 initial + retries) for each GPT request before giving up.
+const MAX_API_ATTEMPTS = 3;
+// Base delay for exponential backoff between retries.
+const RETRY_BASE_DELAY_MS = 800;
 
 interface TranscriptChunk {
   index: number;
+  /** Core segments — the authoritative content for this chunk's chapters. */
   segments: TranscriptSegment[];
+  /** Rendered core transcript text. */
   text: string;
+  /** Token length of the core text (drives per-chunk output targets). */
   tokenLength: number;
+  /** Core window start (used for display, native-chapter filtering, and validation). */
   startSeconds: number;
+  /** Core window end. */
   endSeconds: number;
+  /** Leading overlap text from the previous chunk, for context only ('' if none). */
+  contextText: string;
 }
 
 interface ChunkSummary {
@@ -43,21 +70,36 @@ interface OutputTargets {
   takeawayCount: string;
 }
 
+interface ChunkTargets {
+  summarySentences: string;
+  chapterCount: string;
+  descriptionCount: string;
+  takeawayCount: string;
+}
+
 type TokenCountCache = Map<string, number>;
+
+interface SecondsBounds {
+  minSeconds: number;
+  maxSeconds: number;
+}
 
 // ─── Transcript Helpers ───────────────────────────────────────────────────────
 
+function segmentLine(seg: TranscriptSegment): string {
+  return `[${secondsToTimestamp(seg.startSeconds)}] ${seg.text.trim()}`;
+}
+
 function buildTranscriptText(segments: TranscriptSegment[]): string {
-  return segments
-    .map((seg) => `[${secondsToTimestamp(seg.startSeconds)}] ${seg.text.trim()}`)
-    .join('\n');
+  return segments.map(segmentLine).join('\n');
 }
 
 function buildChunkFromText(
   index: number,
   segments: TranscriptSegment[],
   text: string,
-  tokenLength: number
+  tokenLength: number,
+  contextText: string = ''
 ): TranscriptChunk {
   const first = segments[0];
   const last = segments[segments.length - 1];
@@ -69,6 +111,7 @@ function buildChunkFromText(
     tokenLength,
     startSeconds: Math.max(0, Math.floor(first.startSeconds)),
     endSeconds: Math.max(0, Math.ceil(last.startSeconds + last.durationSeconds)),
+    contextText,
   };
 }
 
@@ -113,62 +156,156 @@ function countTokens(
   return tokenCount;
 }
 
+/**
+ * Marks segment indices that are natural places to start a new chunk: the first
+ * segment after a long silent gap, or the first segment at/after a native
+ * YouTube chapter start. Index 0 is never a break (there is nothing before it).
+ */
+function computePreferredBreaks(
+  segments: TranscriptSegment[],
+  nativeChapters: NativeChapter[]
+): boolean[] {
+  const breaks = new Array<boolean>(segments.length).fill(false);
+
+  for (let i = 1; i < segments.length; i++) {
+    const prevEnd = segments[i - 1].startSeconds + segments[i - 1].durationSeconds;
+    if (segments[i].startSeconds - prevEnd >= SPEECH_GAP_BREAK_SECONDS) {
+      breaks[i] = true;
+    }
+  }
+
+  for (const chapter of nativeChapters) {
+    const idx = segments.findIndex((seg) => seg.startSeconds >= chapter.start_time - 0.5);
+    if (idx > 0) {
+      breaks[idx] = true;
+    }
+  }
+
+  return breaks;
+}
+
+/**
+ * Collects trailing segments immediately before `coreStartIndex` to serve as
+ * read-only context (overlap) for the chunk starting there. Bounded by both a
+ * token budget and a wall-clock window so we never pull in a large preamble.
+ */
+function collectLeadingContext(
+  model: string,
+  segments: TranscriptSegment[],
+  coreStartIndex: number,
+  tokenBudget: number,
+  tokenCache: TokenCountCache
+): TranscriptSegment[] {
+  const newlineTokens = countTokens(model, '\n', tokenCache);
+  const coreStartSeconds = segments[coreStartIndex].startSeconds;
+  const picked: TranscriptSegment[] = [];
+  let tokens = 0;
+
+  for (let i = coreStartIndex - 1; i >= 0; i--) {
+    const seg = segments[i];
+    if (coreStartSeconds - seg.startSeconds > MAX_OVERLAP_SECONDS) {
+      break;
+    }
+    const segTokens = countTokens(model, segmentLine(seg), tokenCache) + newlineTokens;
+    if (picked.length > 0 && tokens + segTokens > tokenBudget) {
+      break;
+    }
+    picked.push(seg);
+    tokens += segTokens;
+  }
+
+  return picked.reverse();
+}
+
+/**
+ * Splits the transcript into token-bounded chunks. Chunk boundaries are snapped
+ * to natural break points (native chapters / speech pauses) once a chunk is
+ * "soft-filled", and each chunk after the first carries a short leading overlap
+ * from the previous section as read-only context. This avoids cutting a topic in
+ * half and gives every chunk enough surrounding context to stay coherent.
+ */
 function splitTranscriptIntoChunks(
   model: string,
   segments: TranscriptSegment[],
   tokenCache: TokenCountCache,
+  nativeChapters: NativeChapter[],
   maxChunkTokens: number = CHUNK_TOKEN_LIMIT
 ): TranscriptChunk[] {
   if (segments.length === 0) {
     return [];
   }
 
+  const newlineTokens = countTokens(model, '\n', tokenCache);
+  const preferredBreaks = computePreferredBreaks(segments, nativeChapters);
+  const softLimit = maxChunkTokens * CHUNK_SOFT_FILL_RATIO;
+  const lineTokens = segments.map((seg) => countTokens(model, segmentLine(seg), tokenCache));
+
+  // 1. Partition segments into contiguous core groups.
   const groups: TranscriptSegment[][] = [];
   let currentGroup: TranscriptSegment[] = [];
   let currentTokens = 0;
-  const newlineTokens = countTokens(model, '\n', tokenCache);
 
-  for (const seg of segments) {
-    const line = `[${secondsToTimestamp(seg.startSeconds)}] ${seg.text.trim()}`;
-    const lineTokens = countTokens(model, line, tokenCache) + (currentGroup.length > 0 ? newlineTokens : 0);
-
-    if (currentGroup.length > 0 && currentTokens + lineTokens > maxChunkTokens) {
+  for (let i = 0; i < segments.length; i++) {
+    // Force-close before exceeding the hard budget.
+    if (currentGroup.length > 0 && currentTokens + newlineTokens + lineTokens[i] > maxChunkTokens) {
       groups.push(currentGroup);
       currentGroup = [];
       currentTokens = 0;
     }
 
-    currentGroup.push(seg);
-    currentTokens += lineTokens;
+    // Close early at a natural boundary once the chunk holds enough content.
+    if (currentGroup.length > 0 && preferredBreaks[i] && currentTokens >= softLimit) {
+      groups.push(currentGroup);
+      currentGroup = [];
+      currentTokens = 0;
+    }
+
+    currentTokens += lineTokens[i] + (currentGroup.length > 0 ? newlineTokens : 0);
+    currentGroup.push(segments[i]);
   }
 
   if (currentGroup.length > 0) {
     groups.push(currentGroup);
   }
 
-  const chunks = groups.map((group, idx) => {
-    const text = buildTranscriptText(group);
-    const tokenLength = countTokens(model, text, tokenCache);
-    return buildChunkFromText(idx, group, text, tokenLength);
-  });
-
-  if (chunks.length > 1) {
-    const lastChunk = chunks[chunks.length - 1];
-    if (lastChunk.tokenLength < maxChunkTokens * MIN_LAST_CHUNK_RATIO) {
-      const prevChunk = chunks[chunks.length - 2];
-      const mergedSegments = [...prevChunk.segments, ...lastChunk.segments];
-      const mergedText = `${prevChunk.text}\n${lastChunk.text}`;
-      const mergedTokens = countTokens(model, mergedText, tokenCache);
-
-      chunks.splice(
-        chunks.length - 2,
-        2,
-        buildChunkFromText(chunks.length - 2, mergedSegments, mergedText, mergedTokens)
-      );
+  // 2. Fold a tiny trailing group into its predecessor.
+  if (groups.length > 1) {
+    const last = groups[groups.length - 1];
+    const lastTokens = countTokens(model, buildTranscriptText(last), tokenCache);
+    if (lastTokens < maxChunkTokens * MIN_LAST_CHUNK_RATIO) {
+      const prev = groups[groups.length - 2];
+      groups.splice(groups.length - 2, 2, [...prev, ...last]);
     }
   }
 
-  return chunks.map((chunk, idx) => ({ ...chunk, index: idx }));
+  // 3. Build chunks, attaching leading overlap as read-only context.
+  const overlapTokenBudget = maxChunkTokens * CHUNK_OVERLAP_RATIO;
+  const chunks: TranscriptChunk[] = [];
+  let globalStart = 0;
+
+  for (const group of groups) {
+    const coreText = buildTranscriptText(group);
+    const coreTokens = countTokens(model, coreText, tokenCache);
+
+    let contextText = '';
+    if (globalStart > 0) {
+      const contextSegs = collectLeadingContext(
+        model,
+        segments,
+        globalStart,
+        overlapTokenBudget,
+        tokenCache
+      );
+      if (contextSegs.length > 0) {
+        contextText = buildTranscriptText(contextSegs);
+      }
+    }
+
+    chunks.push(buildChunkFromText(chunks.length, group, coreText, coreTokens, contextText));
+    globalStart += group.length;
+  }
+
+  return chunks;
 }
 
 function estimateTranscriptDurationSeconds(segments: TranscriptSegment[]): number {
@@ -201,6 +338,45 @@ function deriveOutputTargets(durationSeconds: number, chunkCount: number): Outpu
   };
 }
 
+function formatRange(min: number, max: number): string {
+  const lo = Math.max(1, Math.round(min));
+  const hi = Math.max(lo, Math.round(max));
+  return lo === hi ? `${lo}` : `${lo}-${hi}`;
+}
+
+/**
+ * Derives per-chunk output targets that scale with the amount of content in the
+ * chunk, so denser sections produce proportionally more chapters and takeaways
+ * instead of being squeezed into a fixed cap. Uses both wall-clock duration and
+ * token count and takes the smaller estimate, so sparse chunks (e.g. music with
+ * few words over a long span) don't get over-asked.
+ */
+function deriveChunkTargets(chunk: TranscriptChunk): ChunkTargets {
+  const durationMinutes = Math.max(0, (chunk.endSeconds - chunk.startSeconds) / 60);
+
+  // ~1 chapter boundary per 2.5 minutes of talk, cross-checked against ~1 per 700 tokens.
+  const chaptersByDuration = durationMinutes / 2.5;
+  const chaptersByTokens = chunk.tokenLength / 700;
+  const chapterBase = Math.min(chaptersByDuration, chaptersByTokens);
+  const chapterMin = Math.min(6, Math.max(2, Math.floor(chapterBase * 0.7)));
+  const chapterMax = Math.min(9, Math.max(chapterMin + 1, Math.ceil(chapterBase * 1.15)));
+
+  // Takeaways track content volume but stay a bit sparser than chapters.
+  const takeawayBase = Math.min(durationMinutes / 3.5, chunk.tokenLength / 900);
+  const takeawayMin = Math.max(2, Math.floor(takeawayBase * 0.7));
+  const takeawayMax = Math.max(takeawayMin + 1, Math.ceil(takeawayBase * 1.15));
+
+  const summaryMin = Math.max(3, Math.round(durationMinutes / 3));
+  const summaryMax = Math.max(summaryMin + 1, Math.round(durationMinutes / 1.8));
+
+  return {
+    chapterCount: formatRange(chapterMin, chapterMax),
+    descriptionCount: '3-6',
+    takeawayCount: formatRange(takeawayMin, takeawayMax),
+    summarySentences: formatRange(summaryMin, summaryMax),
+  };
+}
+
 // ─── Prompt Construction ──────────────────────────────────────────────────────
 
 function formatNativeChaptersSection(
@@ -208,12 +384,22 @@ function formatNativeChaptersSection(
   startSeconds?: number,
   endSeconds?: number
 ): string {
-  const filtered = nativeChapters.filter((chapter) => {
-    if (startSeconds === undefined || endSeconds === undefined) {
-      return true;
+  let filtered: NativeChapter[];
+
+  if (startSeconds === undefined || endSeconds === undefined) {
+    filtered = nativeChapters;
+  } else {
+    const sorted = [...nativeChapters].sort((a, b) => a.start_time - b.start_time);
+    filtered = sorted.filter(
+      (chapter) => chapter.start_time >= startSeconds && chapter.start_time <= endSeconds
+    );
+    // Include the chapter already in progress at the window start — it started
+    // before this range but still covers its opening seconds.
+    const ongoing = [...sorted].reverse().find((chapter) => chapter.start_time < startSeconds);
+    if (ongoing && !filtered.some((chapter) => chapter.start_time === ongoing.start_time)) {
+      filtered = [ongoing, ...filtered];
     }
-    return chapter.start_time >= startSeconds && chapter.start_time <= endSeconds;
-  });
+  }
 
   if (filtered.length === 0) {
     return 'NATIVE YOUTUBE CHAPTERS: None available for this range';
@@ -222,6 +408,40 @@ function formatNativeChaptersSection(
   return `NATIVE YOUTUBE CHAPTERS:\n${filtered
     .map((c) => `- ${secondsToTimestamp(c.start_time)} ${c.title}`)
     .join('\n')}`;
+}
+
+/**
+ * Renders the full native-chapter outline of the video (unfiltered), so a chunk
+ * prompt can see the overall structure it sits within, not just its own window.
+ */
+function formatVideoOutlineSection(nativeChapters: NativeChapter[]): string {
+  if (nativeChapters.length === 0) {
+    return '';
+  }
+
+  const sorted = [...nativeChapters].sort((a, b) => a.start_time - b.start_time);
+  return `FULL VIDEO OUTLINE (native YouTube chapters across the whole video, for context):\n${sorted
+    .map((c) => `- ${secondsToTimestamp(c.start_time)} ${c.title}`)
+    .join('\n')}\n\n`;
+}
+
+const MAX_DESCRIPTION_CHARS = 800;
+
+/**
+ * Renders a bounded slice of the video description as shared context. Truncated
+ * so a long description can't dominate the prompt token budget.
+ */
+function formatDescriptionSection(description: string): string {
+  const trimmed = description.trim();
+  if (trimmed === '') {
+    return '';
+  }
+
+  const clipped =
+    trimmed.length > MAX_DESCRIPTION_CHARS
+      ? `${trimmed.slice(0, MAX_DESCRIPTION_CHARS)}…`
+      : trimmed;
+  return `VIDEO DESCRIPTION (context, may be promotional — do not treat as transcript):\n${clipped}\n\n`;
 }
 
 function buildOutputLanguageRules(summaryLanguage?: string): string {
@@ -241,7 +461,7 @@ function buildSinglePassSystemPrompt(
 ): string {
   return `You are an expert video content analyst. Your job is to read YouTube video transcripts and produce structured, accurate notes.
 
-You will receive a transcript with timestamps in [MM:SS] format, optional native chapter markers, and video metadata.
+You will receive a transcript with timestamps in [MM:SS] format (or [H:MM:SS] for videos an hour or longer), optional native chapter markers, and video metadata.
 
 You MUST respond with ONLY a valid JSON object — no markdown code blocks, no explanation text, no preamble.
 The JSON must conform exactly to this schema:
@@ -250,11 +470,11 @@ The JSON must conform exactly to this schema:
   "summary": "string — one dense paragraph summarizing the entire video",
   "chapters": [
     {
-      "timestamp": "string — display time like '0:00' or '14:32'",
+      "timestamp": "string — display time like '0:00', '14:32', or '1:04:30'",
       "seconds": number — the integer seconds value matching the timestamp,
-      "title": "string — concise descriptive chapter title (3–8 words)",
+      "title": "string — descriptive chapter title (3–8 words)",
       "descriptions": [
-        "string — concise sentence describing one key point in this section"
+        "string — a specific point made in this section, preserving concrete details"
       ]
     }
   ],
@@ -266,8 +486,11 @@ The JSON must conform exactly to this schema:
 Rules:
 - Detect between ${targets.chapterCount} meaningful chapter boundaries based on topic shifts
 - If native YouTube chapters are provided, treat them as strong hints but you may add or refine them
-- timestamps must be actual times from the transcript (do not invent times)
-- Each chapter must include 2 to 4 entries in "descriptions"
+- timestamps must be actual times from the transcript (do not invent times); copy the [H:MM:SS] value exactly and set "seconds" to its integer equivalent
+- Each chapter must include 3 to 5 entries in "descriptions"
+- Each description must preserve concrete specifics from the transcript: numbers, prices, measurements, names, product/model names, dates, examples, and comparisons. Do not generalize away figures or proper nouns.
+- Write descriptions as plain prose. Do NOT put any timestamp, time range, or bracketed time (e.g. "[12:34]", "(1:00~1:20)") inside description text — the chapter's "timestamp"/"seconds" fields already mark the time
+- If the transcript contains obvious speech-to-text errors (misheard names, wrong homophones, garbled proper nouns), silently correct them to the most likely intended term from context; do not quote or flag the garbled version
 - Produce between ${targets.takeawayCount} takeaways
 - Summary length target: ${targets.summarySentences} sentences
 ${buildOutputLanguageRules(summaryLanguage)}
@@ -276,6 +499,7 @@ ${buildOutputLanguageRules(summaryLanguage)}
 
 function buildSinglePassUserPrompt(metadata: VideoMetadata, transcriptText: string): string {
   const nativeChaptersSection = formatNativeChaptersSection(metadata.nativeChapters);
+  const descriptionSection = formatDescriptionSection(metadata.description);
 
   return `VIDEO METADATA:
 Title: ${metadata.title}
@@ -283,29 +507,32 @@ Duration: ${metadata.duration}
 Published: ${metadata.publishDate}
 Video ID: ${metadata.videoId}
 
-${nativeChaptersSection}
+${descriptionSection}${nativeChaptersSection}
 
-TRANSCRIPT (format: [MM:SS] text):
+TRANSCRIPT (format: [MM:SS] or [H:MM:SS] text):
 ${transcriptText}
 
 Analyze the above transcript and produce the JSON summary.`;
 }
 
-function buildChunkSystemPrompt(summaryLanguage?: string): string {
-  return `You are an expert video content analyst. You are summarizing one chunk from a longer YouTube transcript.
+function buildChunkSystemPrompt(
+  targets: ChunkTargets,
+  summaryLanguage?: string
+): string {
+  return `You are an expert video content analyst. You are producing DETAILED notes on one chunk from a longer YouTube transcript. Your goal is thoroughness: capture the specifics, not a high-level gist.
 
 You MUST respond with ONLY a valid JSON object — no markdown code blocks, no explanation text, no preamble.
 The JSON must conform exactly to this schema:
 
 {
-  "summary": "string — concise paragraph summarizing only this chunk",
+  "summary": "string — paragraph summarizing only this chunk",
   "chapters": [
     {
-      "timestamp": "string — display time like '0:00' or '14:32'",
+      "timestamp": "string — display time like '0:00', '14:32', or '1:04:30'",
       "seconds": number — the integer seconds value matching the timestamp,
-      "title": "string — concise descriptive chapter title (3–8 words)",
+      "title": "string — descriptive chapter title (3–8 words)",
       "descriptions": [
-        "string — concise sentence describing one key point in this section"
+        "string — a specific point made in this section, preserving concrete details"
       ]
     }
   ],
@@ -316,11 +543,16 @@ The JSON must conform exactly to this schema:
 
 Rules:
 - Use only information present in this chunk
-- Detect between 2 and 5 meaningful chapter boundaries inside this chunk
-- Each chapter must include 2 to 4 entries in "descriptions"
-- Produce between 2 and 5 takeaways
-- Summary length target: 3-5 sentences
-- timestamps must be actual times from the transcript (do not invent times)
+- Detect between ${targets.chapterCount} meaningful chapter boundaries inside this chunk
+- Each chapter must include ${targets.descriptionCount} entries in "descriptions"
+- Each description must preserve concrete specifics from the transcript: numbers, prices, measurements, names, product/model names, dates, examples, comparisons, and step-by-step details. Do not generalize away figures or proper nouns.
+- Prefer several precise descriptions over one vague sentence; do not merge distinct facts into a single bullet
+- Base every chapter, description, and takeaway ONLY on the TRANSCRIPT CHUNK section; never draw content from the PRECEDING CONTEXT lines (they exist only so you understand what came before)
+- Write descriptions as plain prose. Do NOT put any timestamp, time range, or bracketed time (e.g. "[12:34]", "(1:00~1:20)") inside description text — the chapter's "timestamp"/"seconds" fields already mark the time
+- If the transcript contains obvious speech-to-text errors (misheard names, wrong homophones, garbled proper nouns), silently correct them to the most likely intended term from context; do not quote or flag the garbled version
+- Produce between ${targets.takeawayCount} takeaways
+- Summary length target: ${targets.summarySentences} sentences
+- timestamps must be actual times from this chunk (do not invent times); copy the [H:MM:SS] value exactly and set "seconds" to its integer equivalent
 ${buildOutputLanguageRules(summaryLanguage)}
 - Do not include any text outside the JSON object`;
 }
@@ -335,6 +567,15 @@ function buildChunkUserPrompt(
     chunk.startSeconds,
     chunk.endSeconds
   );
+  const descriptionSection = formatDescriptionSection(metadata.description);
+  const outlineSection = formatVideoOutlineSection(metadata.nativeChapters);
+
+  const precedingContextSection = chunk.contextText
+    ? `PRECEDING CONTEXT (from the previous section — for understanding only; do NOT create chapters, descriptions, or takeaways from these lines):
+${chunk.contextText}
+
+`
+    : '';
 
   return `VIDEO METADATA:
 Title: ${metadata.title}
@@ -342,16 +583,16 @@ Duration: ${metadata.duration}
 Published: ${metadata.publishDate}
 Video ID: ${metadata.videoId}
 
-CHUNK INFO:
+${descriptionSection}${outlineSection}CHUNK INFO:
 Chunk: ${chunk.index + 1} of ${totalChunks}
 Time window: ${secondsToTimestamp(chunk.startSeconds)} to ${secondsToTimestamp(chunk.endSeconds)}
 
 ${nativeChaptersSection}
 
-TRANSCRIPT CHUNK (format: [MM:SS] text):
+${precedingContextSection}TRANSCRIPT CHUNK (format: [MM:SS] or [H:MM:SS] text) — this is the section to analyze:
 ${chunk.text}
 
-Analyze ONLY this chunk and produce the JSON summary.`;
+Analyze ONLY the TRANSCRIPT CHUNK above (times ${secondsToTimestamp(chunk.startSeconds)} to ${secondsToTimestamp(chunk.endSeconds)}) and produce the JSON summary. All chapters and their timestamps must fall within this chunk's time window.`;
 }
 
 function buildFinalSynthesisSystemPrompt(
@@ -386,6 +627,7 @@ function buildFinalSynthesisUserPrompt(
   chunkSummaries: ChunkSummary[]
 ): string {
   const nativeChaptersSection = formatNativeChaptersSection(metadata.nativeChapters);
+  const descriptionSection = formatDescriptionSection(metadata.description);
   const chunkPayload = chunkSummaries.map((chunk) => ({
     chunk: chunk.chunkIndex + 1,
     startTimestamp: secondsToTimestamp(chunk.startSeconds),
@@ -401,7 +643,7 @@ Duration: ${metadata.duration}
 Published: ${metadata.publishDate}
 Video ID: ${metadata.videoId}
 
-${nativeChaptersSection}
+${descriptionSection}${nativeChaptersSection}
 
 CHUNK SUMMARIES (JSON):
 ${JSON.stringify(chunkPayload, null, 2)}
@@ -447,12 +689,14 @@ async function summarizeChunksWithConcurrency(
           `${secondsToTimestamp(chunk.startSeconds)}-${secondsToTimestamp(chunk.endSeconds)})...`
       );
 
+      const chunkTargets = deriveChunkTargets(chunk);
       const chunkResult = await requestStructuredSummary(
         openai,
         model,
         `chunk ${chunk.index + 1}/${chunks.length}`,
-        buildChunkSystemPrompt(summaryLanguage),
-        buildChunkUserPrompt(metadata, chunk, chunks.length)
+        buildChunkSystemPrompt(chunkTargets, summaryLanguage),
+        buildChunkUserPrompt(metadata, chunk, chunks.length),
+        { minSeconds: chunk.startSeconds, maxSeconds: chunk.endSeconds }
       );
 
       results[currentIndex] = {
@@ -477,41 +721,123 @@ async function summarizeChunksWithConcurrency(
   });
 }
 
+// ─── Structured Output Schemas ─────────────────────────────────────────────────
+
+// JSON Schemas passed to the Responses API in strict mode. Strict Structured
+// Outputs guarantee the model returns valid JSON matching this shape, so runtime
+// parsing only needs to guard against refusals (empty output), not malformed data.
+// Note: strict mode does not support count constraints (min/maxItems); the number
+// of chapters/takeaways is steered by the prompt targets instead.
+
+const SUMMARY_JSON_SCHEMA: Record<string, unknown> = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['summary', 'chapters', 'takeaways'],
+  properties: {
+    summary: { type: 'string' },
+    chapters: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['timestamp', 'seconds', 'title', 'descriptions'],
+        properties: {
+          timestamp: { type: 'string' },
+          seconds: { type: 'integer' },
+          title: { type: 'string' },
+          descriptions: { type: 'array', items: { type: 'string' } },
+        },
+      },
+    },
+    takeaways: { type: 'array', items: { type: 'string' } },
+  },
+};
+
+const SYNTHESIS_JSON_SCHEMA: Record<string, unknown> = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['summary', 'takeaways'],
+  properties: {
+    summary: { type: 'string' },
+    takeaways: { type: 'array', items: { type: 'string' } },
+  },
+};
+
+function jsonSchemaFormat(name: string, schema: Record<string, unknown>) {
+  return { type: 'json_schema' as const, name, schema, strict: true };
+}
+
 // ─── GPT Summarization ────────────────────────────────────────────────────────
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Classifies whether an error is worth retrying. Transient conditions (network
+ * failures, timeouts, rate limits, 5xx, and malformed/empty model output which
+ * has no HTTP status) retry; deterministic client errors (400/401/403/404) do not.
+ */
+function isRetryableError(err: unknown): boolean {
+  const status = (err as { status?: unknown })?.status;
+  if (typeof status === 'number') {
+    return status === 408 || status === 409 || status === 429 || status >= 500;
+  }
+  return true;
+}
+
+/**
+ * Runs `fn`, retrying transient failures with exponential backoff. Non-retryable
+ * errors and the final attempt's error are rethrown unchanged so callers keep the
+ * original status/message.
+ */
+async function withRetries<T>(stage: string, fn: () => Promise<T>): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= MAX_API_ATTEMPTS; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastError = err;
+      if (attempt >= MAX_API_ATTEMPTS || !isRetryableError(err)) {
+        throw err;
+      }
+      const delay = RETRY_BASE_DELAY_MS * 2 ** (attempt - 1);
+      console.warn(
+        `${stage}: attempt ${attempt}/${MAX_API_ATTEMPTS} failed (${String(err)}). ` +
+          `Retrying in ${delay}ms...`
+      );
+      await sleep(delay);
+    }
+  }
+  throw lastError;
+}
 
 async function requestStructuredSummary(
   openai: OpenAI,
   model: string,
   stage: string,
   instructions: string,
-  input: string
+  input: string,
+  bounds?: SecondsBounds
 ): Promise<GptSummaryResponse> {
-  let rawContent: string;
   try {
-    const response = await openai.responses.create({
-      model,
-      instructions,
-      input,
-      text: { format: { type: 'json_object' } },
+    const parsed = await withRetries(stage, async () => {
+      const response = await openai.responses.create({
+        model,
+        instructions,
+        input,
+        text: { format: jsonSchemaFormat('video_summary', SUMMARY_JSON_SCHEMA) },
+      });
+      return parseGptResponse(response.output_text ?? '');
     });
-
-    rawContent = response.output_text ?? '';
+    return normalizeSummary(parsed, bounds);
   } catch (err) {
     throw new Error(
-      `GPT API call failed during ${stage}.\n` +
-        `Check that OPENAI_API_KEY is valid and has sufficient quota.\n` +
+      `GPT request failed during ${stage} (after up to ${MAX_API_ATTEMPTS} attempts).\n` +
+        `If this is an auth/quota issue, check that OPENAI_API_KEY is valid and has sufficient quota.\n` +
         `Details: ${String(err)}`
     );
   }
-
-  let parsed: GptSummaryResponse;
-  try {
-    parsed = parseGptResponse(rawContent);
-  } catch (err) {
-    throw new Error(`Failed to parse GPT response during ${stage}: ${String(err)}`);
-  }
-
-  return normalizeSummary(parsed);
 }
 
 async function requestFinalSynthesis(
@@ -521,28 +847,22 @@ async function requestFinalSynthesis(
   instructions: string,
   input: string
 ): Promise<Pick<GptSummaryResponse, 'summary' | 'takeaways'>> {
-  let rawContent: string;
   try {
-    const response = await openai.responses.create({
-      model,
-      instructions,
-      input,
-      text: { format: { type: 'json_object' } },
+    return await withRetries(stage, async () => {
+      const response = await openai.responses.create({
+        model,
+        instructions,
+        input,
+        text: { format: jsonSchemaFormat('video_synthesis', SYNTHESIS_JSON_SCHEMA) },
+      });
+      return parseFinalSynthesisResponse(response.output_text ?? '');
     });
-
-    rawContent = response.output_text ?? '';
   } catch (err) {
     throw new Error(
-      `GPT API call failed during ${stage}.\n` +
-        `Check that OPENAI_API_KEY is valid and has sufficient quota.\n` +
+      `GPT request failed during ${stage} (after up to ${MAX_API_ATTEMPTS} attempts).\n` +
+        `If this is an auth/quota issue, check that OPENAI_API_KEY is valid and has sufficient quota.\n` +
         `Details: ${String(err)}`
     );
-  }
-
-  try {
-    return parseFinalSynthesisResponse(rawContent);
-  } catch (err) {
-    throw new Error(`Failed to parse GPT response during ${stage}: ${String(err)}`);
   }
 }
 
@@ -587,11 +907,18 @@ export async function summarizeWithGpt(
       model,
       'single-pass summarization',
       buildSinglePassSystemPrompt(targets, normalizedSummaryLanguage),
-      buildSinglePassUserPrompt(metadata, transcriptText)
+      buildSinglePassUserPrompt(metadata, transcriptText),
+      { minSeconds: 0, maxSeconds: durationSeconds }
     );
   }
 
-  const chunks = splitTranscriptIntoChunks(model, segments, tokenCache, CHUNK_TOKEN_LIMIT);
+  const chunks = splitTranscriptIntoChunks(
+    model,
+    segments,
+    tokenCache,
+    metadata.nativeChapters,
+    CHUNK_TOKEN_LIMIT
+  );
   const targets = deriveOutputTargets(durationSeconds, chunks.length);
 
   console.log(
@@ -607,7 +934,7 @@ export async function summarizeWithGpt(
     normalizedSummaryLanguage
   );
 
-  console.log(`Combining ${chunkSummaries.length} chunk chapters without merge stage...`);
+  console.log(`Combining and merging chapters from ${chunkSummaries.length} chunk(s)...`);
   const combinedChapters = combineChunkChapters(chunkSummaries);
 
   console.log('Generating final summary and takeaways from chunk summaries...');
@@ -754,15 +1081,162 @@ function normalizeTakeaways(items: string[]): string[] {
   return takeaways;
 }
 
-function normalizeChapters(chapters: Chapter[]): Chapter[] {
+/**
+ * Parses a display timestamp ("M:SS" or "H:MM:SS") back to seconds. Returns
+ * undefined for anything that isn't a 2- or 3-part colon-separated time, so the
+ * caller can fall back to the model-provided numeric `seconds`.
+ */
+function parseTimestampToSeconds(timestamp: string): number | undefined {
+  const parts = timestamp.trim().split(':');
+  if (parts.length < 2 || parts.length > 3) {
+    return undefined;
+  }
+
+  let seconds = 0;
+  for (const part of parts) {
+    const value = Number(part);
+    if (!Number.isFinite(value) || value < 0) {
+      return undefined;
+    }
+    seconds = seconds * 60 + value;
+  }
+  return Math.round(seconds);
+}
+
+/**
+ * Resolves a chapter's authoritative second value. The transcript shows the model
+ * display timestamps, so a parsed timestamp is trusted over the model's `seconds`
+ * field (which the model often miscomputes, especially past the 1-hour mark). The
+ * result is clamped into the provided window so hallucinated times can't point the
+ * ?t= link outside the chapter's actual section.
+ */
+function resolveChapterSeconds(chapter: Chapter, bounds?: SecondsBounds): number {
+  const fromTimestamp = parseTimestampToSeconds(chapter.timestamp);
+  const raw = fromTimestamp ?? Math.max(0, Math.round(chapter.seconds));
+  if (!bounds) {
+    return raw;
+  }
+  return Math.min(Math.max(raw, bounds.minSeconds), bounds.maxSeconds);
+}
+
+// Matches a display time token ("M:SS" or "H:MM:SS"). Seconds are constrained to
+// 00-59 so ratios like "3:2" (single trailing digit) don't register as times.
+const TIME_TOKEN_SOURCE = '\\d{1,2}:[0-5]\\d(?::[0-5]\\d)?';
+
+/**
+ * Extracts the first display time token in a description and returns it as
+ * seconds — the model's own claim of when this point occurs. Used to relocate a
+ * description that was filed under the wrong chapter. Returns undefined if the
+ * text has no timestamp.
+ */
+function firstTimeMarkerSeconds(text: string): number | undefined {
+  const match = text.match(new RegExp(`(\\d{1,2}):([0-5]\\d)(?::([0-5]\\d))?`));
+  if (!match) {
+    return undefined;
+  }
+  const first = Number(match[1]);
+  const second = Number(match[2]);
+  const third = match[3] !== undefined ? Number(match[3]) : undefined;
+  return third !== undefined ? first * 3600 + second * 60 + third : first * 60 + second;
+}
+
+/**
+ * Removes inline time markers from a description so bullets read as plain prose
+ * and their formatting is consistent regardless of which chunk produced them.
+ * Handles bracketed ("[12:34]"), parenthesized single/range ("(1:00~1:20)"), and
+ * leading bare markers, including a trailing Korean particle ("26:58에서 …").
+ */
+function stripTimeMarkers(text: string): string {
+  const bracketed = new RegExp(`\\[\\s*${TIME_TOKEN_SOURCE}\\s*\\]`, 'g');
+  const parenthesized = new RegExp(
+    `\\(\\s*${TIME_TOKEN_SOURCE}(?:\\s*[~\\-–]\\s*${TIME_TOKEN_SOURCE})?\\s*\\)`,
+    'g'
+  );
+  const leadingBare = new RegExp(
+    `^\\s*${TIME_TOKEN_SOURCE}(?:\\s*[~\\-–]\\s*${TIME_TOKEN_SOURCE})?` +
+      `(?:에서는|에서|에는|엔|에|께|경|쯤|부터|까지|의)?[\\s,:\\-–]*`
+  );
+
+  return text
+    .replace(bracketed, ' ')
+    .replace(parenthesized, ' ')
+    .replace(leadingBare, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
+/**
+ * Relocates descriptions filed under the wrong chapter (overlap leakage, or a
+ * point whose time belongs to a later chapter) to the chapter that actually
+ * covers their time marker, then strips the markers. Preserves every description
+ * — nothing is dropped for being mis-timed, only moved. Chapters must be sorted
+ * by seconds ascending.
+ */
+function redistributeDescriptions(chapters: Chapter[]): void {
+  if (chapters.length === 0) {
+    return;
+  }
+
+  const starts = chapters.map((chapter) => chapter.seconds);
+  const chapterIndexForTime = (time: number): number => {
+    let idx = 0;
+    for (let i = 0; i < starts.length; i++) {
+      if (starts[i] <= time) {
+        idx = i;
+      } else {
+        break;
+      }
+    }
+    return idx;
+  };
+
+  const incoming: string[][] = chapters.map(() => []);
+
+  for (let i = 0; i < chapters.length; i++) {
+    const windowStart = starts[i];
+    const windowEnd = i + 1 < starts.length ? starts[i + 1] : Number.POSITIVE_INFINITY;
+    const kept: string[] = [];
+
+    for (const description of chapters[i].descriptions) {
+      const marker = firstTimeMarkerSeconds(description);
+      const clearlyEarlier =
+        marker !== undefined && marker < windowStart - DESCRIPTION_REASSIGN_TOLERANCE_SECONDS;
+      const clearlyLater =
+        marker !== undefined && marker >= windowEnd + DESCRIPTION_REASSIGN_TOLERANCE_SECONDS;
+
+      if (marker !== undefined && (clearlyEarlier || clearlyLater)) {
+        const target = chapterIndexForTime(marker);
+        if (target !== i) {
+          incoming[target].push(description);
+          continue;
+        }
+      }
+      kept.push(description);
+    }
+
+    chapters[i].descriptions = kept;
+  }
+
+  for (let i = 0; i < chapters.length; i++) {
+    if (incoming[i].length > 0) {
+      chapters[i].descriptions.push(...incoming[i]);
+    }
+    chapters[i].descriptions = Array.from(
+      new Set(chapters[i].descriptions.map(stripTimeMarkers).filter((text) => text !== ''))
+    );
+  }
+}
+
+function normalizeChapters(chapters: Chapter[], bounds?: SecondsBounds): Chapter[] {
   const sortedChapters = chapters
     .map((chapter) => {
-      const seconds = Math.max(0, Math.round(chapter.seconds));
-      const timestamp = chapter.timestamp.trim() || secondsToTimestamp(seconds);
+      // Derive seconds from the (transcript-copied) timestamp, clamp to the window,
+      // then regenerate the display timestamp so it always agrees with the ?t= URL.
+      const seconds = resolveChapterSeconds(chapter, bounds);
       return {
         ...chapter,
         seconds,
-        timestamp,
+        timestamp: secondsToTimestamp(seconds),
         title: chapter.title.trim(),
         descriptions: Array.from(
           new Set(
@@ -776,25 +1250,79 @@ function normalizeChapters(chapters: Chapter[]): Chapter[] {
     .filter((chapter) => chapter.title !== '' && chapter.descriptions.length > 0)
     .sort((a, b) => a.seconds - b.seconds);
 
-  const dedupedChapters: Chapter[] = [];
-  const seenChapterKeys = new Set<string>();
+  // Merge chapters that describe the same boundary. Because adjacent chunks share
+  // overlapping context, two chunks often emit the same section a few seconds apart
+  // under slightly different titles; collapse those into one, unioning descriptions.
+  const mergedChapters: Chapter[] = [];
   for (const chapter of sortedChapters) {
-    const key = `${chapter.seconds}:${chapter.title.toLowerCase()}`;
-    if (seenChapterKeys.has(key)) continue;
-    seenChapterKeys.add(key);
-    dedupedChapters.push(chapter);
+    const last = mergedChapters[mergedChapters.length - 1];
+    if (last) {
+      const gap = chapter.seconds - last.seconds;
+      const sameBoundary =
+        gap <= CHAPTER_NEAR_SECONDS ||
+        (gap <= CHAPTER_MERGE_WINDOW_SECONDS && titlesSimilar(last.title, chapter.title));
+      if (sameBoundary) {
+        last.descriptions = Array.from(new Set([...last.descriptions, ...chapter.descriptions]));
+        // Keep the more descriptive of the two titles.
+        if (chapter.title.length > last.title.length) {
+          last.title = chapter.title;
+        }
+        continue;
+      }
+    }
+    mergedChapters.push({ ...chapter });
   }
 
-  if (dedupedChapters.length === 0) {
+  // Relocate mis-timed descriptions to the chapter that covers their time, then
+  // strip inline markers so every bullet reads as plain, consistently-formatted prose.
+  redistributeDescriptions(mergedChapters);
+
+  const finalChapters = mergedChapters.filter((chapter) => chapter.descriptions.length > 0);
+
+  if (finalChapters.length === 0) {
     throw new Error('GPT response has no valid chapters after normalization.');
   }
 
-  return dedupedChapters;
+  return finalChapters;
 }
 
-function normalizeSummary(result: GptSummaryResponse): GptSummaryResponse {
+function titleTokens(title: string): Set<string> {
+  return new Set(
+    title
+      .toLowerCase()
+      .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+      .split(/\s+/)
+      .filter((word) => word.length > 0)
+  );
+}
+
+/**
+ * Loose title-similarity check (token Jaccard ≥ 0.5) used to decide whether two
+ * near-in-time chapters are really the same boundary seen from adjacent chunks.
+ */
+function titlesSimilar(a: string, b: string): boolean {
+  const tokensA = titleTokens(a);
+  const tokensB = titleTokens(b);
+  if (tokensA.size === 0 || tokensB.size === 0) {
+    return false;
+  }
+
+  let intersection = 0;
+  for (const token of tokensA) {
+    if (tokensB.has(token)) {
+      intersection += 1;
+    }
+  }
+  const union = tokensA.size + tokensB.size - intersection;
+  return intersection / union >= 0.5;
+}
+
+function normalizeSummary(
+  result: GptSummaryResponse,
+  bounds?: SecondsBounds
+): GptSummaryResponse {
   const summary = result.summary.trim();
-  const dedupedChapters = normalizeChapters(result.chapters);
+  const dedupedChapters = normalizeChapters(result.chapters, bounds);
 
   const takeaways = normalizeTakeaways(result.takeaways);
 

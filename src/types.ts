@@ -35,6 +35,8 @@ export interface VideoMetadata {
   duration: string;
   /** ISO date string e.g. "2024-01-15" */
   publishDate: string;
+  /** Video description text (may be empty); used as cross-chunk context. */
+  description: string;
   /** Native YouTube chapter markers if any */
   nativeChapters: NativeChapter[];
 }

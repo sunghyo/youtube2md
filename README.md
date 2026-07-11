@@ -186,22 +186,24 @@ The tool tries these methods in order:
 
 Summarization runs in two modes based on transcript token count (using `tiktoken` with model-aware encoding):
 
-1. **Normalize transcript**: convert each segment to `[MM:SS] spoken text`.
+1. **Normalize transcript**: convert each segment to `[MM:SS] spoken text` (or `[H:MM:SS]` past the one-hour mark).
 2. **Count tokens**: compute transcript size with `tiktoken` (fallback to `o200k_base`).
 3. **Choose mode**:
    - **Single-pass** when total tokens are `<= 5000`
    - **Chunked** when total tokens are `> 5000`
-4. **Single-pass mode**: one GPT request with metadata, native YouTube chapters, and full transcript.
+4. **Single-pass mode**: one GPT request with metadata, video description, native YouTube chapters, and full transcript.
 5. **Chunked mode**:
-   - Split into chunks targeting `5000` tokens.
+   - Split into chunks targeting `5000` tokens, snapping boundaries to natural break points (native chapter starts or speech pauses) once a chunk is soft-filled, so a topic isn't cut mid-sentence.
    - Merge tiny final chunk (`< 25%` of limit) into the previous chunk.
+   - Carry a short **read-only overlap** from the previous section into each chunk for context.
+   - Give each chunk the video description and full chapter outline, and scale its output targets (chapters / descriptions / takeaways) to the amount of content it holds.
    - Summarize each chunk in parallel (up to 4 concurrent jobs).
-   - Combine chapters locally (chronological sort + dedupe).
+   - Combine chapters locally, merging near-in-time boundary duplicates that adjacent chunks emit.
    - One final GPT request for full-video summary and takeaways.
-6. **Validate + normalize**: require non-empty `summary`, `chapters`, `takeaways`; sort and deduplicate.
+6. **Structured output + validation**: requests use strict `json_schema` Structured Outputs so the model returns schema-valid JSON; transient failures retry with exponential backoff. Chapter times are resolved from the (transcript-copied) timestamp, clamped to their section's window, and re-rendered so display and `?t=` link always agree.
 7. **Render Markdown**: convert to final output.
 
-### Token thresholds
+### Token thresholds & tuning
 
 Defined in `src/summarizer.ts`:
 
@@ -210,6 +212,10 @@ Defined in `src/summarizer.ts`:
 | `SINGLE_PASS_TOKEN_LIMIT` | `5000` | Use single-pass below this |
 | `CHUNK_TOKEN_LIMIT` | `5000` | Target tokens per chunk |
 | `MIN_LAST_CHUNK_RATIO` | `0.25` | Merge final chunk if smaller than 25% of limit |
+| `CHUNK_SOFT_FILL_RATIO` | `0.6` | Fraction of budget after which a chunk closes at the next natural boundary |
+| `SPEECH_GAP_BREAK_SECONDS` | `2.5` | Silent gap treated as a topic break |
+| `CHUNK_OVERLAP_RATIO` | `0.12` | Leading read-only overlap carried into each chunk |
+| `MAX_API_ATTEMPTS` | `3` | Attempts per GPT request before giving up |
 
 ---
 

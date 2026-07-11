@@ -71,6 +71,7 @@ export async function fetchVideoMetadata(videoId: string): Promise<VideoMetadata
     title: details.title,
     duration: formatSeconds(totalSeconds),
     publishDate: (details.publishDate ?? details.uploadDate ?? 'Unknown').slice(0, 10),
+    description: (details.description ?? '').trim(),
     nativeChapters,
   };
 }
