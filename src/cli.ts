@@ -23,7 +23,7 @@ export function parseCli(): CliOptions {
     )
     .option(
       '--model <model>',
-      'OpenAI model to use (default: gpt-5-mini)'
+      'OpenAI model to use (default: gpt-5.6-luna)'
     )
     .option(
       '--out <path>',

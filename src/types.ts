@@ -11,6 +11,18 @@ export interface TranscriptSegment {
   durationSeconds: number;
 }
 
+/** The strategy that produced the normalized transcript segments. */
+export type TranscriptSource =
+  | 'youtube-captions'
+  | 'youtube-transcript'
+  | 'whisper';
+
+/** Transcript segments together with the strategy that produced them. */
+export interface TranscriptResult {
+  segments: TranscriptSegment[];
+  source: TranscriptSource;
+}
+
 /**
  * A detected chapter with display timestamp and seconds for URL generation.
  */
@@ -64,6 +76,7 @@ export interface GptSummaryResponse {
  */
 export interface SummaryData {
   metadata: VideoMetadata;
+  transcriptSource: TranscriptSource;
   summary: string;
   chapters: Chapter[];
   takeaways: string[];
@@ -74,6 +87,7 @@ export interface SummaryData {
  */
 export type ErrorCode =
   | 'E_TRANSCRIPT_UNAVAILABLE'
+  | 'E_SUMMARIZER_UNAVAILABLE'
   | 'E_OPENAI_AUTH'
   | 'E_OPENAI_RATE_LIMIT'
   | 'E_WHISPER_FAILED'
@@ -101,6 +115,7 @@ export interface ExtractOutput {
   ok: true;
   videoId: string;
   metadata: VideoMetadata;
+  transcriptSource: TranscriptSource;
   segments: TranscriptSegment[];
 }
 

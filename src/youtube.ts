@@ -2,11 +2,17 @@ import ytdl from '@distube/ytdl-core';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import type OpenAI from 'openai';
 import { YoutubeTranscript } from 'youtube-transcript';
 import { AppError } from './types.js';
-import type { VideoMetadata, TranscriptSegment, NativeChapter } from './types.js';
+import type {
+  VideoMetadata,
+  TranscriptSegment,
+  TranscriptResult,
+  NativeChapter,
+} from './types.js';
 
 // ─── URL Parsing ──────────────────────────────────────────────────────────────
 
@@ -97,7 +103,25 @@ interface InnertubePlayerResponse {
     status?: string;
     reason?: string;
   };
+  streamingData?: {
+    adaptiveFormats?: InnertubeStreamingFormat[];
+    formats?: InnertubeStreamingFormat[];
+  };
 }
+
+interface InnertubeStreamingFormat {
+  approxDurationMs?: string;
+  bitrate?: number;
+  contentLength?: string;
+  itag?: number;
+  mimeType?: string;
+  url?: string;
+}
+
+type DownloadableAudioFormat = InnertubeStreamingFormat & {
+  mimeType: string;
+  url: string;
+};
 
 interface BrowserCookie {
   domain?: string;
@@ -118,16 +142,6 @@ interface YouTubeAuthContext {
   sourceLabel: string;
 }
 
-type YtdlPlayerClient = 'WEB_EMBEDDED' | 'TV' | 'IOS' | 'ANDROID' | 'WEB';
-
-const AUDIO_DOWNLOAD_CLIENT_SETS: ReadonlyArray<ReadonlyArray<YtdlPlayerClient>> = [
-  ['WEB_EMBEDDED', 'IOS', 'ANDROID', 'TV'],
-  ['TV'],
-  ['IOS'],
-  ['ANDROID'],
-  ['WEB'],
-];
-
 const MAX_WHISPER_FILE_BYTES = 24 * 1024 * 1024;
 const ANDROID_CLIENT_VERSION = '20.10.38';
 const ANDROID_OS_VERSION = '14';
@@ -139,22 +153,23 @@ let loggedYouTubeAuthContext = false;
  * Fetches a transcript using three strategies in order:
  * 1. YouTube caption tracks from the watch page / ytdl basic info
  * 2. youtube-transcript library fallback
- * 3. ytdl audio download → OpenAI Whisper STT (requires openai client; skipped when null)
+ * 3. Android InnerTube audio download → OpenAI Whisper STT (requires openai client; skipped when null)
  *
- * Pass `openai: null` in --extract-only mode when no API key is available.
- * Whisper fallback is skipped and E_TRANSCRIPT_UNAVAILABLE is thrown instead.
+ * Pass `openai: null` whenever no API key is available. Caption retrieval still
+ * works, but Whisper fallback is skipped and E_TRANSCRIPT_UNAVAILABLE is thrown
+ * if both caption strategies fail.
  */
 export async function fetchTranscript(
   videoId: string,
   openai: OpenAI | null
-): Promise<TranscriptSegment[]> {
+): Promise<TranscriptResult> {
   const failures: string[] = [];
 
   try {
     console.log('Fetching transcript via YouTube captions...');
     const segments = await fetchTranscriptViaYouTubeCaptions(videoId);
     if (segments.length > 0) {
-      return segments;
+      return { segments, source: 'youtube-captions' };
     }
     throw new Error('Caption fetch returned empty transcript.');
   } catch (captionErr) {
@@ -166,7 +181,7 @@ export async function fetchTranscript(
     console.log('Retrying transcript via youtube-transcript fallback...');
     const segments = await fetchTranscriptViaYoutubeTranscript(videoId);
     if (segments.length > 0) {
-      return segments;
+      return { segments, source: 'youtube-transcript' };
     }
     throw new Error('youtube-transcript fallback returned an empty transcript.');
   } catch (fallbackErr) {
@@ -187,7 +202,8 @@ export async function fetchTranscript(
 
   console.warn('Falling back to Whisper STT (this may take a while)...');
   try {
-    return await fetchTranscriptViaWhisper(videoId, openai);
+    const segments = await fetchTranscriptViaWhisper(videoId, openai);
+    return { segments, source: 'whisper' };
   } catch (whisperErr) {
     failures.push(`Whisper STT: ${String(whisperErr)}`);
     throw new AppError(
@@ -279,7 +295,7 @@ async function fetchAndroidInnertubePlayer(videoId: string): Promise<InnertubePl
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'User-Agent': `com.google.android.youtube/${ANDROID_CLIENT_VERSION} (Linux; U; Android ${ANDROID_OS_VERSION})`,
+      'User-Agent': getAndroidYouTubeUserAgent(),
     },
     body: JSON.stringify({
       videoId,
@@ -578,18 +594,18 @@ async function fetchTranscriptViaWhisper(
   let tmpFile: string | null = null;
 
   try {
-    const resolvedAudio = await resolveAudioDownload(videoId);
+    const audioFormat = await resolveAudioDownload(videoId);
     tmpFile = path.join(
       os.tmpdir(),
-      `youtube2md-${videoId}-${Date.now()}.${resolveTempAudioExtension(resolvedAudio.format)}`
+      `youtube2md-${videoId}-${Date.now()}.${resolveTempAudioExtension(audioFormat)}`
     );
 
     console.log(
       `Downloading audio for Whisper transcription using ${describeAudioFormat(
-        resolvedAudio.format
+        audioFormat
       )}...`
     );
-    await downloadAudioToFile(resolvedAudio.info, resolvedAudio.format, tmpFile);
+    await downloadAudioToFile(audioFormat, tmpFile);
 
     // Check file size — Whisper rejects files larger than 25MB
     const stats = fs.statSync(tmpFile);
@@ -609,15 +625,9 @@ async function fetchTranscriptViaWhisper(
       model: 'whisper-1',
       response_format: 'verbose_json',
       timestamp_granularities: ['segment'],
-    } as unknown as Parameters<typeof openai.audio.transcriptions.create>[0]);
+    });
 
-    // verbose_json includes segments — TypeScript types don't reflect this
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const segments = (transcription as any).segments as Array<{
-      start: number;
-      end: number;
-      text: string;
-    }>;
+    const segments = transcription.segments;
 
     if (!segments || segments.length === 0) {
       throw new Error('Whisper returned no transcript segments.');
@@ -640,78 +650,82 @@ async function fetchTranscriptViaWhisper(
 }
 
 /**
- * Downloads a specific audio-capable format to a local file.
+ * Downloads a directly-addressable Android InnerTube audio format to a local file.
  * Uses stream/promises pipeline for proper backpressure and error propagation.
  */
 async function downloadAudioToFile(
-  info: ytdl.videoInfo,
-  format: ytdl.videoFormat,
+  format: DownloadableAudioFormat,
   filePath: string
 ): Promise<void> {
-  const audioStream = ytdl.downloadFromInfo(info, { format });
+  const response = await fetch(format.url, {
+    headers: {
+      Range: 'bytes=0-',
+      'User-Agent': getAndroidYouTubeUserAgent(),
+    },
+  });
+
+  if (response.status !== 200 && response.status !== 206) {
+    await response.body?.cancel();
+    throw new Error(`Audio download failed: HTTP ${response.status}`);
+  }
+  if (!response.body) {
+    throw new Error('Audio download returned an empty response body.');
+  }
+
+  const responseSize = Number.parseInt(response.headers.get('content-length') ?? '', 10);
+  if (Number.isFinite(responseSize) && responseSize > MAX_WHISPER_FILE_BYTES) {
+    await response.body.cancel();
+    throw new Error(
+      `Audio download is ${(responseSize / (1024 * 1024)).toFixed(1)}MB, ` +
+        `exceeding Whisper's 25MB limit.`
+    );
+  }
+
+  const audioStream = Readable.fromWeb(response.body);
   const writeStream = fs.createWriteStream(filePath);
   await pipeline(audioStream, writeStream);
 }
 
 async function resolveAudioDownload(
   videoId: string
-): Promise<{ info: ytdl.videoInfo; format: ytdl.videoFormat }> {
-  const failures: string[] = [];
-  const url = buildVideoUrl(videoId);
-
-  for (const clientSet of AUDIO_DOWNLOAD_CLIENT_SETS) {
-    try {
-      const info = await ytdl.getInfo(
-        url,
-        getYtdlRequestOptions({ playerClients: [...clientSet] })
-      );
-      const format = selectWhisperAudioFormat(info.formats);
-      if (!format) {
-        throw new Error('No audio-capable formats returned.');
-      }
-      return { info, format };
-    } catch (err) {
-      failures.push(`${clientSet.join('+')}: ${String(err)}`);
-    }
+): Promise<DownloadableAudioFormat> {
+  const player = await fetchAndroidInnertubePlayer(videoId);
+  const formats = [
+    ...(player.streamingData?.adaptiveFormats ?? []),
+    ...(player.streamingData?.formats ?? []),
+  ];
+  const format = selectWhisperAudioFormat(formats);
+  if (format) {
+    return format;
   }
 
+  const playability = [player.playabilityStatus?.status, player.playabilityStatus?.reason]
+    .filter(Boolean)
+    .join(': ');
   throw new Error(
-    'Unable to resolve a playable audio format.\n' +
-      failures.map((entry) => `  - ${entry}`).join('\n')
+    'Android InnerTube returned no directly downloadable audio format.' +
+      (playability ? ` Playability: ${playability}` : '')
   );
 }
 
-function selectWhisperAudioFormat(formats: ytdl.videoFormat[]): ytdl.videoFormat | null {
-  const audioFormats = formats.filter((format) => format.hasAudio && format.url);
+function selectWhisperAudioFormat(
+  formats: InnertubeStreamingFormat[]
+): DownloadableAudioFormat | null {
+  const audioFormats = formats.filter(isWhisperUploadSafeFormat);
   if (audioFormats.length === 0) {
     return null;
   }
 
-  const supportedFormats = audioFormats.filter(isWhisperUploadSafeFormat);
   return (
-    selectPreferredAudioFormat(supportedFormats) ??
-    selectPreferredAudioFormat(audioFormats) ??
+    pickHighestQualityWithinLimit(audioFormats) ??
+    pickSmallestFormat(audioFormats) ??
     null
   );
 }
 
-function selectPreferredAudioFormat(formats: ytdl.videoFormat[]): ytdl.videoFormat | null {
-  if (formats.length === 0) {
-    return null;
-  }
-
-  const audioOnlyFormats = formats.filter((format) => !format.hasVideo);
-
-  return (
-    pickHighestQualityWithinLimit(audioOnlyFormats) ??
-    pickHighestQualityWithinLimit(formats) ??
-    pickSmallestFormat(audioOnlyFormats) ??
-    pickSmallestFormat(formats) ??
-    null
-  );
-}
-
-function pickHighestQualityWithinLimit(formats: ytdl.videoFormat[]): ytdl.videoFormat | null {
+function pickHighestQualityWithinLimit(
+  formats: DownloadableAudioFormat[]
+): DownloadableAudioFormat | null {
   const withinLimit = formats.filter((format) => {
     const sizeBytes = estimateFormatSizeBytes(format);
     return sizeBytes !== undefined && sizeBytes <= MAX_WHISPER_FILE_BYTES;
@@ -719,17 +733,17 @@ function pickHighestQualityWithinLimit(formats: ytdl.videoFormat[]): ytdl.videoF
   return [...withinLimit].sort(compareHigherQualityAudioFormat)[0] ?? null;
 }
 
-function pickSmallestFormat(formats: ytdl.videoFormat[]): ytdl.videoFormat | null {
+function pickSmallestFormat(
+  formats: DownloadableAudioFormat[]
+): DownloadableAudioFormat | null {
   return [...formats].sort(compareSmallestAudioFormat)[0] ?? null;
 }
 
-function compareHigherQualityAudioFormat(a: ytdl.videoFormat, b: ytdl.videoFormat): number {
-  const audioOnlyDiff = Number(a.hasVideo) - Number(b.hasVideo);
-  if (audioOnlyDiff !== 0) {
-    return audioOnlyDiff;
-  }
-
-  const audioBitrateDiff = (b.audioBitrate ?? 0) - (a.audioBitrate ?? 0);
+function compareHigherQualityAudioFormat(
+  a: DownloadableAudioFormat,
+  b: DownloadableAudioFormat
+): number {
+  const audioBitrateDiff = (b.bitrate ?? 0) - (a.bitrate ?? 0);
   if (audioBitrateDiff !== 0) {
     return audioBitrateDiff;
   }
@@ -737,69 +751,75 @@ function compareHigherQualityAudioFormat(a: ytdl.videoFormat, b: ytdl.videoForma
   return compareEstimatedSize(a, b);
 }
 
-function compareSmallestAudioFormat(a: ytdl.videoFormat, b: ytdl.videoFormat): number {
-  const audioOnlyDiff = Number(a.hasVideo) - Number(b.hasVideo);
-  if (audioOnlyDiff !== 0) {
-    return audioOnlyDiff;
-  }
-
+function compareSmallestAudioFormat(
+  a: DownloadableAudioFormat,
+  b: DownloadableAudioFormat
+): number {
   const sizeDiff = compareEstimatedSize(a, b);
   if (sizeDiff !== 0) {
     return sizeDiff;
   }
 
-  return (b.audioBitrate ?? 0) - (a.audioBitrate ?? 0);
+  return (b.bitrate ?? 0) - (a.bitrate ?? 0);
 }
 
-function compareEstimatedSize(a: ytdl.videoFormat, b: ytdl.videoFormat): number {
+function compareEstimatedSize(
+  a: DownloadableAudioFormat,
+  b: DownloadableAudioFormat
+): number {
   const aSize = estimateFormatSizeBytes(a) ?? Number.MAX_SAFE_INTEGER;
   const bSize = estimateFormatSizeBytes(b) ?? Number.MAX_SAFE_INTEGER;
   return aSize - bSize;
 }
 
-function estimateFormatSizeBytes(format: ytdl.videoFormat): number | undefined {
-  const contentLength = Number.parseInt(format.contentLength, 10);
+function estimateFormatSizeBytes(format: DownloadableAudioFormat): number | undefined {
+  const contentLength = Number.parseInt(format.contentLength ?? '', 10);
   if (Number.isFinite(contentLength) && contentLength > 0) {
     return contentLength;
   }
 
   const durationMs = Number.parseInt(format.approxDurationMs ?? '', 10);
-  const audioBitrate = format.audioBitrate;
+  const audioBitrate = format.bitrate;
   if (
     Number.isFinite(durationMs) &&
     durationMs > 0 &&
     typeof audioBitrate === 'number' &&
     audioBitrate > 0
   ) {
-    return Math.round((audioBitrate * 1000 / 8) * (durationMs / 1000));
+    return Math.round((audioBitrate / 8) * (durationMs / 1000));
   }
 
   return undefined;
 }
 
-function isWhisperUploadSafeFormat(format: ytdl.videoFormat): boolean {
-  return format.container === 'mp4' || format.container === 'webm';
+function isWhisperUploadSafeFormat(
+  format: InnertubeStreamingFormat
+): format is DownloadableAudioFormat {
+  if (!format.url || !format.mimeType) {
+    return false;
+  }
+  const mimeType = format.mimeType.split(';', 1)[0]?.trim().toLowerCase();
+  return mimeType === 'audio/mp4' || mimeType === 'audio/webm';
 }
 
-function resolveTempAudioExtension(format: ytdl.videoFormat): string {
-  if (format.container === 'mp4' && !format.hasVideo) {
-    return 'm4a';
-  }
-  return format.container;
+function resolveTempAudioExtension(format: DownloadableAudioFormat): string {
+  return format.mimeType.startsWith('audio/mp4') ? 'm4a' : 'webm';
 }
 
-function describeAudioFormat(format: ytdl.videoFormat): string {
-  const parts: string[] = [format.container];
-  if (typeof format.audioBitrate === 'number') {
-    parts.push(`${format.audioBitrate}kbps`);
+function describeAudioFormat(format: DownloadableAudioFormat): string {
+  const parts: string[] = [resolveTempAudioExtension(format)];
+  if (typeof format.bitrate === 'number') {
+    parts.push(`${Math.round(format.bitrate / 1000)}kbps`);
   }
-  if (format.audioCodec) {
-    parts.push(format.audioCodec);
-  }
-  if (format.hasVideo) {
-    parts.push('muxed');
+  const codec = /codecs="([^"]+)"/.exec(format.mimeType)?.[1];
+  if (codec) {
+    parts.push(codec);
   }
   return parts.join(' ');
+}
+
+function getAndroidYouTubeUserAgent(): string {
+  return `com.google.android.youtube/${ANDROID_CLIENT_VERSION} (Linux; U; Android ${ANDROID_OS_VERSION})`;
 }
 
 // ─── Utilities ────────────────────────────────────────────────────────────────

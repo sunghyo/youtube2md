@@ -1,6 +1,6 @@
-import type OpenAI from 'openai';
 import { createHash } from 'node:crypto';
 import { encoding_for_model, get_encoding, type Tiktoken, type TiktokenModel } from 'tiktoken';
+import type { SummaryProvider } from './summary-provider.js';
 import type {
   TranscriptSegment,
   VideoMetadata,
@@ -657,7 +657,7 @@ function combineChunkChapters(chunkSummaries: ChunkSummary[]): Chapter[] {
 }
 
 async function summarizeChunksWithConcurrency(
-  openai: OpenAI,
+  provider: SummaryProvider,
   model: string,
   metadata: VideoMetadata,
   chunks: TranscriptChunk[],
@@ -691,7 +691,7 @@ async function summarizeChunksWithConcurrency(
 
       const chunkTargets = deriveChunkTargets(chunk);
       const chunkResult = await requestStructuredSummary(
-        openai,
+        provider,
         model,
         `chunk ${chunk.index + 1}/${chunks.length}`,
         buildChunkSystemPrompt(chunkTargets, summaryLanguage),
@@ -763,10 +763,6 @@ const SYNTHESIS_JSON_SCHEMA: Record<string, unknown> = {
   },
 };
 
-function jsonSchemaFormat(name: string, schema: Record<string, unknown>) {
-  return { type: 'json_schema' as const, name, schema, strict: true };
-}
-
 // ─── GPT Summarization ────────────────────────────────────────────────────────
 
 function sleep(ms: number): Promise<void> {
@@ -813,7 +809,7 @@ async function withRetries<T>(stage: string, fn: () => Promise<T>): Promise<T> {
 }
 
 async function requestStructuredSummary(
-  openai: OpenAI,
+  provider: SummaryProvider,
   model: string,
   stage: string,
   instructions: string,
@@ -822,26 +818,28 @@ async function requestStructuredSummary(
 ): Promise<GptSummaryResponse> {
   try {
     const parsed = await withRetries(stage, async () => {
-      const response = await openai.responses.create({
+      const output = await provider.generate({
         model,
         instructions,
         input,
-        text: { format: jsonSchemaFormat('video_summary', SUMMARY_JSON_SCHEMA) },
+        schemaName: 'video_summary',
+        schema: SUMMARY_JSON_SCHEMA,
       });
-      return parseGptResponse(response.output_text ?? '');
+      return parseGptResponse(output);
     });
     return normalizeSummary(parsed, bounds);
   } catch (err) {
     throw new Error(
-      `GPT request failed during ${stage} (after up to ${MAX_API_ATTEMPTS} attempts).\n` +
-        `If this is an auth/quota issue, check that OPENAI_API_KEY is valid and has sufficient quota.\n` +
+      `${provider.name} request failed during ${stage} ` +
+        `(after up to ${MAX_API_ATTEMPTS} attempts).\n` +
+        `Check the provider login, model access, and available quota.\n` +
         `Details: ${String(err)}`
     );
   }
 }
 
 async function requestFinalSynthesis(
-  openai: OpenAI,
+  provider: SummaryProvider,
   model: string,
   stage: string,
   instructions: string,
@@ -849,18 +847,20 @@ async function requestFinalSynthesis(
 ): Promise<Pick<GptSummaryResponse, 'summary' | 'takeaways'>> {
   try {
     return await withRetries(stage, async () => {
-      const response = await openai.responses.create({
+      const output = await provider.generate({
         model,
         instructions,
         input,
-        text: { format: jsonSchemaFormat('video_synthesis', SYNTHESIS_JSON_SCHEMA) },
+        schemaName: 'video_synthesis',
+        schema: SYNTHESIS_JSON_SCHEMA,
       });
-      return parseFinalSynthesisResponse(response.output_text ?? '');
+      return parseFinalSynthesisResponse(output);
     });
   } catch (err) {
     throw new Error(
-      `GPT request failed during ${stage} (after up to ${MAX_API_ATTEMPTS} attempts).\n` +
-        `If this is an auth/quota issue, check that OPENAI_API_KEY is valid and has sufficient quota.\n` +
+      `${provider.name} request failed during ${stage} ` +
+        `(after up to ${MAX_API_ATTEMPTS} attempts).\n` +
+        `Check the provider login, model access, and available quota.\n` +
         `Details: ${String(err)}`
     );
   }
@@ -869,17 +869,17 @@ async function requestFinalSynthesis(
 /**
  * Sends the transcript and metadata to GPT for structured summarization.
  *
- * @param openai   - Initialized OpenAI client
+ * @param provider - Structured summary provider (Codex SDK or OpenAI API)
  * @param segments - Normalized transcript segments
  * @param metadata - Video metadata including native chapters
- * @param model    - GPT model ID (default: gpt-5-mini)
+ * @param model    - GPT model ID (default: gpt-5.6-luna)
  * @param summaryLanguage - Optional output language override
  */
-export async function summarizeWithGpt(
-  openai: OpenAI,
+export async function summarizeWithProvider(
+  provider: SummaryProvider,
   segments: TranscriptSegment[],
   metadata: VideoMetadata,
-  model: string = 'gpt-5-mini',
+  model: string = 'gpt-5.6-luna',
   summaryLanguage?: string
 ): Promise<GptSummaryResponse> {
   if (segments.length === 0) {
@@ -894,7 +894,8 @@ export async function summarizeWithGpt(
   const durationSeconds = estimateTranscriptDurationSeconds(segments);
 
   console.log(
-    `Preparing GPT summarization (${model}) — transcript: ${transcriptTokenCount} tokens, ` +
+    `Preparing summarization with ${provider.name} (${model}) — ` +
+      `transcript: ${transcriptTokenCount} tokens, ` +
       `${transcriptText.length} chars, ` +
       `${segments.length} segments`
   );
@@ -903,7 +904,7 @@ export async function summarizeWithGpt(
     const targets = deriveOutputTargets(durationSeconds, 1);
     console.log(`Transcript fits single-pass mode (<= ${SINGLE_PASS_TOKEN_LIMIT} tokens).`);
     return requestStructuredSummary(
-      openai,
+      provider,
       model,
       'single-pass summarization',
       buildSinglePassSystemPrompt(targets, normalizedSummaryLanguage),
@@ -927,7 +928,7 @@ export async function summarizeWithGpt(
   );
 
   const chunkSummaries = await summarizeChunksWithConcurrency(
-    openai,
+    provider,
     model,
     metadata,
     chunks,
@@ -939,7 +940,7 @@ export async function summarizeWithGpt(
 
   console.log('Generating final summary and takeaways from chunk summaries...');
   const finalSynthesis = await requestFinalSynthesis(
-    openai,
+    provider,
     model,
     'chunk-final synthesis',
     buildFinalSynthesisSystemPrompt(targets, normalizedSummaryLanguage),

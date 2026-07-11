@@ -30,7 +30,13 @@ configureYtdlEnvironment();
 import OpenAI from 'openai';
 import { parseCli } from './cli.js';
 import { extractVideoId, fetchVideoMetadata, fetchTranscript } from './youtube.js';
-import { summarizeWithGpt } from './summarizer.js';
+import { summarizeWithProvider } from './summarizer.js';
+import {
+  createCodexSummaryProvider,
+  createOpenAiSummaryProvider,
+  detectCodexChatGptLogin,
+  type SummaryProvider,
+} from './summary-provider.js';
 import { generateMarkdown, writeMarkdownFile } from './markdown.js';
 import type { SummaryData, CliOptions } from './types.js';
 import { AppError } from './types.js';
@@ -65,10 +71,22 @@ async function runExtractPipeline(opts: CliOptions): Promise<void> {
   console.log(`Title: "${metadata.title}" | Duration: ${metadata.duration}`);
 
   console.log('Fetching transcript...');
-  const segments = await fetchTranscript(videoId, openai);
-  console.log(`Transcript fetched: ${segments.length} segments.`);
+  const transcript = await fetchTranscript(videoId, openai);
+  console.log(
+    `Transcript fetched: ${transcript.segments.length} segments via ${transcript.source}.`
+  );
 
-  const output = JSON.stringify({ ok: true, videoId, metadata, segments }, null, 2);
+  const output = JSON.stringify(
+    {
+      ok: true,
+      videoId,
+      metadata,
+      transcriptSource: transcript.source,
+      segments: transcript.segments,
+    },
+    null,
+    2
+  );
 
   if (opts.stdout) {
     process.stdout.write(output + '\n');
@@ -89,18 +107,35 @@ async function runExtractPipeline(opts: CliOptions): Promise<void> {
 
 async function runFullPipeline(opts: CliOptions): Promise<void> {
   const apiKey = process.env['OPENAI_API_KEY']?.trim();
-  if (!apiKey) {
+  const openai = apiKey ? new OpenAI({ apiKey }) : null;
+  const model = opts.model ?? process.env['OPENAI_MODEL'] ?? 'gpt-5.6-luna';
+
+  const providers: SummaryProvider[] = [];
+  const codexAvailability = await detectCodexChatGptLogin();
+  if (codexAvailability.available) {
+    try {
+      providers.push(createCodexSummaryProvider());
+    } catch (err) {
+      console.warn(`Codex SDK initialization failed: ${String(err)}`);
+    }
+  } else {
+    console.log(`Codex SDK unavailable: ${codexAvailability.reason}`);
+  }
+  if (openai) {
+    providers.push(createOpenAiSummaryProvider(openai));
+  }
+
+  if (providers.length === 0) {
     throw new AppError(
-      'E_OPENAI_AUTH',
-      'OPENAI_API_KEY is not set.\n' +
-        'Set it in your .env file or export it in your shell:\n' +
+      'E_SUMMARIZER_UNAVAILABLE',
+      'No summarization provider is available.\n' +
+        'Log in to Codex with ChatGPT (preferred):\n' +
+        '  codex login\n' +
+        'Or set an OpenAI API key as a fallback:\n' +
         '  export OPENAI_API_KEY=sk-...\n' +
         'Tip: use --extract-only to fetch transcripts without an API key.'
     );
   }
-
-  const openai = new OpenAI({ apiKey });
-  const model = opts.model ?? process.env['OPENAI_MODEL'] ?? 'gpt-5-mini';
 
   const videoId = extractVideoId(opts.url);
   console.log(`Processing video: ${videoId}`);
@@ -113,8 +148,11 @@ async function runFullPipeline(opts: CliOptions): Promise<void> {
   }
 
   console.log('Fetching transcript...');
-  const segments = await fetchTranscript(videoId, openai);
-  console.log(`Transcript fetched: ${segments.length} segments.`);
+  const transcript = await fetchTranscript(videoId, openai);
+  const { segments } = transcript;
+  console.log(
+    `Transcript fetched: ${segments.length} segments via ${transcript.source}.`
+  );
 
   if (opts.lang) {
     console.log(`Summary language override: ${opts.lang}`);
@@ -122,23 +160,62 @@ async function runFullPipeline(opts: CliOptions): Promise<void> {
     console.log('Summary language: same as transcript');
   }
 
-  let gptResult: Awaited<ReturnType<typeof summarizeWithGpt>>;
-  try {
-    gptResult = await summarizeWithGpt(openai, segments, metadata, model, opts.lang);
-  } catch (err) {
-    const msg = String(err);
-    if (msg.includes('401') || /invalid.api.key/i.test(msg) || /authentication/i.test(msg)) {
-      throw new AppError('E_OPENAI_AUTH', msg);
+  let gptResult: Awaited<ReturnType<typeof summarizeWithProvider>> | undefined;
+  let selectedProvider: SummaryProvider | undefined;
+  const providerFailures: Array<{ provider: SummaryProvider; error: unknown }> = [];
+
+  for (const [index, provider] of providers.entries()) {
+    console.log(`Summarization provider: ${provider.name}`);
+    try {
+      gptResult = await summarizeWithProvider(
+        provider,
+        segments,
+        metadata,
+        model,
+        opts.lang
+      );
+      selectedProvider = provider;
+      break;
+    } catch (err) {
+      providerFailures.push({ provider, error: err });
+      const nextProvider = providers[index + 1];
+      if (nextProvider) {
+        console.warn(
+          `${provider.name} failed; falling back to ${nextProvider.name}.\n` +
+            `Details: ${String(err)}`
+        );
+      }
     }
-    if (msg.includes('429') || /rate.limit/i.test(msg)) {
-      throw new AppError('E_OPENAI_RATE_LIMIT', msg);
-    }
-    throw err;
   }
-  console.log(`GPT summary complete: ${gptResult.chapters.length} chapters detected.`);
+
+  if (!gptResult || !selectedProvider) {
+    const details = providerFailures
+      .map(({ provider, error }) => `  - ${provider.name}: ${String(error)}`)
+      .join('\n');
+    const openAiFailure = providerFailures.find(({ provider }) => provider.kind === 'openai');
+    if (openAiFailure) {
+      const msg = String(openAiFailure.error);
+      if (msg.includes('401') || /invalid.api.key/i.test(msg) || /authentication/i.test(msg)) {
+        throw new AppError('E_OPENAI_AUTH', msg);
+      }
+      if (msg.includes('429') || /rate.limit/i.test(msg)) {
+        throw new AppError('E_OPENAI_RATE_LIMIT', msg);
+      }
+    }
+
+    throw new AppError(
+      'E_SUMMARIZER_UNAVAILABLE',
+      `All configured summarization providers failed.\n${details}`
+    );
+  }
+  console.log(
+    `Summary complete via ${selectedProvider.name}: ` +
+      `${gptResult.chapters.length} chapters detected.`
+  );
 
   const summaryData: SummaryData = {
     metadata,
+    transcriptSource: transcript.source,
     summary: gptResult.summary,
     chapters: gptResult.chapters,
     takeaways: gptResult.takeaways,
@@ -148,7 +225,17 @@ async function runFullPipeline(opts: CliOptions): Promise<void> {
   if (opts.stdout) {
     if (opts.json) {
       process.stdout.write(
-        JSON.stringify({ ok: true, videoId, metadata, markdown }, null, 2) + '\n'
+        JSON.stringify(
+          {
+            ok: true,
+            videoId,
+            metadata,
+            transcriptSource: transcript.source,
+            markdown,
+          },
+          null,
+          2
+        ) + '\n'
       );
     } else {
       process.stdout.write(markdown);
@@ -165,7 +252,17 @@ async function runFullPipeline(opts: CliOptions): Promise<void> {
 
   if (opts.json) {
     process.stdout.write(
-      JSON.stringify({ ok: true, videoId, metadata, outputPath: outPath }, null, 2) + '\n'
+      JSON.stringify(
+        {
+          ok: true,
+          videoId,
+          metadata,
+          transcriptSource: transcript.source,
+          outputPath: outPath,
+        },
+        null,
+        2
+      ) + '\n'
     );
   } else {
     console.log(`\nDone! Summary written to:\n  ${outPath}`);

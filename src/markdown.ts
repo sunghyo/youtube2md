@@ -6,7 +6,7 @@ import type { SummaryData } from './types.js';
  * Generates the complete Markdown document as a string.
  */
 export function generateMarkdown(data: SummaryData): string {
-  const { metadata, summary, chapters, takeaways } = data;
+  const { metadata, transcriptSource, summary, chapters, takeaways } = data;
   const { videoId, title, duration, publishDate } = metadata;
   const watchUrl = `https://youtu.be/${videoId}`;
 
@@ -25,12 +25,16 @@ export function generateMarkdown(data: SummaryData): string {
     .join('\n\n');
 
   const takeawaysSection = takeaways.map((t) => `- ${t}`).join('\n');
+  const transcriptNotice = transcriptSource === 'whisper'
+    ? [`> Transcript source: OpenAI Whisper STT (\`whisper-1\`)`, ``]
+    : [];
 
   return [
     `# ${title}`,
     ``,
     `> [Watch on YouTube](${watchUrl}) | Duration: ${duration} | Published: ${publishDate}`,
     ``,
+    ...transcriptNotice,
     `## Summary`,
     ``,
     summary,

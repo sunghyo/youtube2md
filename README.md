@@ -9,7 +9,7 @@ Convert any YouTube video into a structured Markdown summary — with chapter de
 
 Two modes:
 
-- **Standalone** — fetch transcript + summarize with OpenAI → write Markdown file
+- **Standalone** — fetch transcript + summarize with Codex SDK or OpenAI → write Markdown file
 - **Extract-only** — fetch transcript only, no API key required → output JSON for external processing
 
 ## Install
@@ -18,10 +18,10 @@ Two modes:
 npm install -g youtube2md
 ```
 
-Or use without installing:
+Or use without installing (reuses an existing Codex ChatGPT login when available):
 
 ```bash
-OPENAI_API_KEY=sk-... npx youtube2md --url https://youtu.be/VIDEO_ID
+npx youtube2md --url https://youtu.be/VIDEO_ID
 ```
 
 ## Usage
@@ -40,7 +40,7 @@ youtube2md --url https://youtu.be/VIDEO_ID --out-dir ./output
 youtube2md --url https://youtu.be/VIDEO_ID --lang Korean
 
 # Use a specific model
-youtube2md --url https://youtu.be/VIDEO_ID --model gpt-5-mini
+youtube2md --url https://youtu.be/VIDEO_ID --model gpt-5.6-luna
 
 # Extract transcript only (no API key required if captions are available)
 youtube2md --url https://youtu.be/VIDEO_ID --extract-only
@@ -59,7 +59,7 @@ Output is saved to `./summaries/<video_id>.md` (full pipeline) or `./summaries/<
 | Option | Description |
 |---|---|
 | `--url <youtube_url>` | YouTube video URL (required) |
-| `--model <model>` | OpenAI model to use (default: `gpt-5-mini`). Overrides `OPENAI_MODEL` env var. |
+| `--model <model>` | OpenAI model to use (default: `gpt-5.6-luna`). Overrides `OPENAI_MODEL` env var. |
 | `--lang <language>` | Summary output language (default: same as transcript language) |
 | `--out <path>` | Output file path |
 | `--out-dir <dir>` | Output directory; file is named `<video_id>.md` (default: `./summaries`) |
@@ -72,18 +72,36 @@ Output is saved to `./summaries/<video_id>.md` (full pipeline) or `./summaries/<
 ## Requirements
 
 - Node.js 18+
-- OpenAI API key — required for summarization; **not required** for `--extract-only` when captions are available
+- An active Codex ChatGPT login, or an OpenAI API key as a fallback
+- `OPENAI_API_KEY` is still required when caption retrieval fails and Whisper STT is needed
+
+## Authentication priority
+
+Summarization providers are tried in this order:
+
+1. **Codex SDK with ChatGPT login** — detected with the bundled Codex CLI and used without passing `OPENAI_API_KEY` to Codex.
+2. **OpenAI API** — used only when Codex ChatGPT login is unavailable or Codex summarization fails.
+
+Log in to Codex once, then run `youtube2md` normally:
+
+```bash
+codex login
+codex login status
+youtube2md --url https://youtu.be/VIDEO_ID
+```
+
+Only a ChatGPT-authenticated Codex session is preferred. A Codex session authenticated with an API key is not treated as the keyless Codex path.
 
 ## Environment variables
 
 | Variable | Description |
 |---|---|
-| `OPENAI_API_KEY` | Required for summarization. Not needed in `--extract-only` mode if captions are available. |
-| `OPENAI_MODEL` | Optional. Fallback model if `--model` is not passed (default: `gpt-5-mini`). |
+| `OPENAI_API_KEY` | Optional summarization fallback; also enables Whisper STT when captions are unavailable. |
+| `OPENAI_MODEL` | Optional. Fallback model if `--model` is not passed (default: `gpt-5.6-luna`). |
 | `YOUTUBE_COOKIES_PATH` | Optional. Path to an EditThisCookie JSON export for `youtube.com`. Used for metadata, captions, and audio fallback requests. |
 | `YOUTUBE_COOKIE_HEADER` | Optional. Raw `Cookie` header string for `youtube.com` requests. Useful when you already have a browser request cookie string. |
 
-Set your API key before running:
+To configure the API fallback, export a key:
 
 ```bash
 export OPENAI_API_KEY=sk-...
@@ -108,6 +126,8 @@ When YouTube exposes caption tracks but blocks the actual transcript or download
 
 > [Watch on YouTube](https://youtu.be/VIDEO_ID) | Duration: 12:34 | Published: 2024-01-01
 
+> Transcript source: OpenAI Whisper STT (`whisper-1`)
+
 ## Summary
 
 One paragraph overview of the video content.
@@ -127,6 +147,8 @@ One paragraph overview of the video content.
 - Key point 2
 ```
 
+The transcript source line is included only when the caption fallbacks were unavailable and Whisper STT produced the transcript.
+
 ### JSON (extract-only)
 
 ```json
@@ -140,6 +162,7 @@ One paragraph overview of the video content.
     "publishDate": "2024-01-01",
     "nativeChapters": []
   },
+  "transcriptSource": "youtube-captions",
   "segments": [
     { "text": "Hello world", "startSeconds": 0.0, "durationSeconds": 2.4 }
   ]
@@ -153,6 +176,7 @@ One paragraph overview of the video content.
   "ok": true,
   "videoId": "VIDEO_ID",
   "metadata": { "..." },
+  "transcriptSource": "whisper",
   "outputPath": "/path/to/summaries/VIDEO_ID.md"
 }
 ```
@@ -168,7 +192,8 @@ All errors emit a structured object when `--json` is active:
 | Code | Cause |
 |---|---|
 | `E_TRANSCRIPT_UNAVAILABLE` | No captions found and Whisper fallback unavailable |
-| `E_OPENAI_AUTH` | `OPENAI_API_KEY` missing or invalid |
+| `E_SUMMARIZER_UNAVAILABLE` | Neither Codex SDK nor the OpenAI API fallback could summarize |
+| `E_OPENAI_AUTH` | The configured `OPENAI_API_KEY` fallback is invalid |
 | `E_OPENAI_RATE_LIMIT` | OpenAI rate limit hit |
 | `E_WHISPER_FAILED` | Whisper STT transcription failed |
 | `E_NETWORK` | Network or YouTube access error |
@@ -180,11 +205,13 @@ The tool tries these methods in order:
 
 1. **YouTube captions via watch-page / InnerTube requests** — uses caption tracks directly and applies configured YouTube cookies when available (supports `json3` and XML timedtext formats)
 2. **`youtube-transcript` fallback** — retries with an alternate parser path
-3. **OpenAI Whisper STT fallback** — downloads audio and transcribes it (requires `OPENAI_API_KEY`; audio must be under 25 MB). Cookie-backed requests are applied here too when configured. Skipped in `--extract-only` mode when no API key is set.
+3. **OpenAI Whisper STT fallback** — resolves a directly downloadable audio-only stream through the Android InnerTube player, downloads it, and transcribes it with `whisper-1` segment timestamps (requires `OPENAI_API_KEY`; audio must be under 25 MB). The resulting JSON records `transcriptSource: "whisper"`, and full Markdown output adds a Whisper source notice. Skipped when no API key is set.
 
 ## Summary process
 
 Summarization runs in two modes based on transcript token count (using `tiktoken` with model-aware encoding):
+
+The tool first attempts the Codex SDK with an active ChatGPT login. If that path is unavailable or fails, it retries the complete summarization through the OpenAI Responses API when `OPENAI_API_KEY` is configured. Codex runs in a temporary read-only working directory with tool, command, and web use disabled by the summarization prompt and runtime settings.
 
 1. **Normalize transcript**: convert each segment to `[MM:SS] spoken text` (or `[H:MM:SS]` past the one-hour mark).
 2. **Count tokens**: compute transcript size with `tiktoken` (fallback to `o200k_base`).
@@ -200,7 +227,7 @@ Summarization runs in two modes based on transcript token count (using `tiktoken
    - Summarize each chunk in parallel (up to 4 concurrent jobs).
    - Combine chapters locally, merging near-in-time boundary duplicates that adjacent chunks emit.
    - One final GPT request for full-video summary and takeaways.
-6. **Structured output + validation**: requests use strict `json_schema` Structured Outputs so the model returns schema-valid JSON; transient failures retry with exponential backoff. Chapter times are resolved from the (transcript-copied) timestamp, clamped to their section's window, and re-rendered so display and `?t=` link always agree.
+6. **Structured output + validation**: Codex SDK requests use `outputSchema`; OpenAI Responses API requests use strict `json_schema`. Transient failures retry with exponential backoff. Chapter times are resolved from the (transcript-copied) timestamp, clamped to their section's window, and re-rendered so display and `?t=` link always agree.
 7. **Render Markdown**: convert to final output.
 
 ### Token thresholds & tuning
@@ -227,9 +254,9 @@ git clone https://github.com/sunghyo/youtube2md
 cd youtube2md
 npm install
 
-# Set your API key
+# Optional: configure the API/Whisper fallback
 cp .env.example .env
-# Edit .env and add your OPENAI_API_KEY
+# Edit .env and add OPENAI_API_KEY if needed
 
 # Run without building
 npx tsx src/index.ts --url https://www.youtube.com/watch?v=VIDEO_ID
@@ -240,6 +267,7 @@ npx tsx src/index.ts --url https://www.youtube.com/watch?v=VIDEO_ID
 ```bash
 npm run build   # Compile TypeScript to dist/
 npm run dev     # Run directly with tsx (no build needed)
+npm test        # Run TypeScript tests with Node's test runner
 npm run clean   # Remove dist/
 ```
 
@@ -247,12 +275,14 @@ npm run clean   # Remove dist/
 
 ```
 src/
-├── index.ts       # Entry point — pipeline branching and orchestration
-├── cli.ts         # CLI argument parsing (Commander)
-├── youtube.ts     # Metadata fetch + transcript fetch with fallback
-├── summarizer.ts  # OpenAI Responses API prompting + JSON parsing
-├── markdown.ts    # Markdown generation + file writing
-└── types.ts       # Shared interfaces, AppError, error codes
+├── index.ts             # Entry point — pipeline branching and orchestration
+├── cli.ts               # CLI argument parsing (Commander)
+├── youtube.ts           # Metadata fetch + transcript fetch with fallback
+├── summary-provider.ts  # Codex-first provider selection and OpenAI adapter
+├── summarizer.ts        # Provider-neutral prompting + JSON parsing
+├── markdown.ts          # Markdown generation + file writing
+├── __tests__/            # TypeScript tests run with npm test
+└── types.ts             # Shared interfaces, AppError, error codes
 summaries/         # Default output directory
 ```
 

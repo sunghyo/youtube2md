@@ -18,6 +18,7 @@
     "summary",
     "transcript",
     "openai",
+    "codex",
     "gpt"
   ],
   "repository": {
@@ -29,14 +30,16 @@
     "build": "tsc && chmod +x dist/index.js",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js",
+    "test": "tsx --test src/__tests__/*.test.ts",
     "clean": "rm -rf dist",
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
     "@distube/ytdl-core": "^4.15.9",
+    "@openai/codex-sdk": "^0.144.1",
     "commander": "^12.1.0",
     "dotenv": "^16.4.5",
-    "openai": "^5.0.0",
+    "openai": "^6.46.0",
     "tiktoken": "^1.0.22",
     "youtube-transcript": "^1.3.1"
   },
