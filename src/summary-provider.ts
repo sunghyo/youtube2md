@@ -3,7 +3,6 @@ import { mkdirSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
-import { Codex } from '@openai/codex-sdk';
 import type OpenAI from 'openai';
 
 export interface StructuredSummaryRequest {
@@ -85,12 +84,25 @@ function resolveCodexCliEntry(): string {
   return require.resolve('@openai/codex/bin/codex.js');
 }
 
+function resolveCodexSdkEntry(): string {
+  return require.resolve('@openai/codex-sdk');
+}
+
 /**
  * Checks the bundled Codex CLI's active auth mode. Only ChatGPT login is
  * accepted here; API-key-based Codex login intentionally does not take
  * priority over the application's explicit OPENAI_API_KEY fallback.
  */
 export async function detectCodexChatGptLogin(): Promise<CodexAvailability> {
+  try {
+    resolveCodexSdkEntry();
+  } catch {
+    return {
+      available: false,
+      reason: 'Optional @openai/codex-sdk provider is not installed.',
+    };
+  }
+
   let codexEntry: string;
   try {
     codexEntry = resolveCodexCliEntry();
@@ -144,7 +156,8 @@ ${input}
 </source_content>`;
 }
 
-export function createCodexSummaryProvider(): SummaryProvider {
+export async function createCodexSummaryProvider(): Promise<SummaryProvider> {
+  const { Codex } = await import('@openai/codex-sdk');
   const workingDirectory = path.join(os.tmpdir(), 'youtube2md', 'codex-summarizer');
   mkdirSync(workingDirectory, { recursive: true });
 

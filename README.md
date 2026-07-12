@@ -3,14 +3,14 @@
 [![npm version](https://img.shields.io/npm/v/youtube2md)](https://www.npmjs.com/package/youtube2md)
 [![npm downloads](https://img.shields.io/npm/dm/youtube2md)](https://www.npmjs.com/package/youtube2md)
 
-> Also available as a skill: [youtube-summary on ClawhHub](https://clawhub.ai/sunghyo/youtube-summary)
+> Also available as a skill: [youtube-summary on ClawHub](https://clawhub.ai/sunghyo/youtube-summary)
 
-Convert any YouTube video into a structured Markdown summary — with chapter detection, clickable timestamp links, and key takeaways.
+Convert a YouTube video into a structured Markdown summary with chapter detection, clickable timestamp links, and key takeaways. When the optional Codex SDK and a ChatGPT-authenticated session are available, the CLI uses Codex first. Otherwise, it falls back to the OpenAI API and can transcribe captionless videos with Whisper.
 
 Two modes:
 
 - **Standalone** — fetch transcript + summarize with Codex SDK or OpenAI → write Markdown file
-- **Extract-only** — fetch transcript only, no API key required → output JSON for external processing
+- **Extract-only** — fetch transcript only, no API key required → output JSON, plain text, or timestamped text
 
 ## Install
 
@@ -18,7 +18,13 @@ Two modes:
 npm install -g youtube2md
 ```
 
-Or use without installing (reuses an existing Codex ChatGPT login when available):
+The OpenAI API provider is included. The Codex provider is optional so the base CLI does not install a large platform binary:
+
+```bash
+npm install -g @openai/codex-sdk youtube2md
+```
+
+Or use without installing:
 
 ```bash
 npx youtube2md --url https://youtu.be/VIDEO_ID
@@ -39,47 +45,91 @@ youtube2md --url https://youtu.be/VIDEO_ID --out-dir ./output
 # Set summary language
 youtube2md --url https://youtu.be/VIDEO_ID --lang Korean
 
+# Prefer Korean captions, while still falling back to another available track
+youtube2md --url https://youtu.be/VIDEO_ID --caption-lang ko
+
 # Use a specific model
 youtube2md --url https://youtu.be/VIDEO_ID --model gpt-5.6-luna
 
+# Force the OpenAI provider instead of auto-detection
+youtube2md --url https://youtu.be/VIDEO_ID --provider openai
+
 # Extract transcript only (no API key required if captions are available)
 youtube2md --url https://youtu.be/VIDEO_ID --extract-only
+
+# Extract timestamp-preserving text without Python post-processing
+youtube2md --url https://youtu.be/VIDEO_ID --extract-only --extract-format timestamped-text
+
+# Privacy boundary: never send audio to Whisper, even if OPENAI_API_KEY is set
+youtube2md --url https://youtu.be/VIDEO_ID --extract-only --captions-only
 
 # Use signed-in YouTube cookies when captions/audio need an authenticated session
 YOUTUBE_COOKIES_PATH=./cookies.youtube.json youtube2md --url https://youtu.be/VIDEO_ID --extract-only
 
 # Machine-readable JSON output from full pipeline
 youtube2md --url https://youtu.be/VIDEO_ID --json --stdout
+
+# Print Markdown without creating an output file
+youtube2md --url https://youtu.be/VIDEO_ID --stdout
+
+# Timestamped URLs are accepted; quote URLs containing "&"
+youtube2md --url 'https://www.youtube.com/watch?v=VIDEO_ID&t=1547s' --stdout
 ```
 
-Output is saved to `./summaries/<video_id>.md` (full pipeline) or `./summaries/<video_id>.json` (extract-only) by default.
+Output is saved to `./summaries/<video_id>.md` (full pipeline), `./summaries/<video_id>.json` (JSON extract), or `./summaries/<video_id>.txt` (text extracts) by default.
+
+Playback parameters such as `t=1547s` are accepted when extracting the video ID, but they do not limit the summary range: youtube2md processes the complete video and generates its own timestamped chapters.
+
+Supported URL shapes include `watch?v=`, `youtu.be`, Shorts, Live, Embed, Music, and `youtube-nocookie.com` embed URLs.
 
 ### Options
 
 | Option | Description |
 |---|---|
 | `--url <youtube_url>` | YouTube video URL (required) |
-| `--model <model>` | OpenAI model to use (default: `gpt-5.6-luna`). Overrides `OPENAI_MODEL` env var. |
+| `--model <model>` | Summarization model (default: `gpt-5.6-luna`). Overrides `OPENAI_MODEL`. |
 | `--lang <language>` | Summary output language (default: same as transcript language) |
+| `--caption-lang <code>` | Preferred caption language such as `en`, `ko`, or `pt-BR`; falls back if unavailable |
+| `--provider <provider>` | `auto`, `codex`, or `openai` (default: `auto`) |
 | `--out <path>` | Output file path |
-| `--out-dir <dir>` | Output directory; file is named `<video_id>.md` (default: `./summaries`) |
-| `--extract-only` | Skip summarization, output raw transcript as JSON |
-| `--json` | Emit result as JSON (success and errors); progress logs go to stderr |
+| `--out-dir <dir>` | Output directory; file is named `<video_id>.<ext>` (default: `./summaries`) |
+| `--extract-only` | Skip summarization and output transcript data |
+| `--extract-format <format>` | `json`, `text`, or `timestamped-text` (default: `json`) |
+| `--captions-only` | Never send audio to Whisper; fail when captions are unavailable |
+| `--json` | Emit a versioned JSON success/error envelope; progress logs go to stderr |
 | `--stdout` | Write output to stdout instead of a file |
 | `--help` | Show help |
 | `--version` | Show version |
 
+### Agent and ClawHub integration
+
+When `--json` or `--stdout` is active, progress is written only to stderr and stdout remains a single data payload. Wrappers should not append human-readable status lines to stdout.
+
+Recommended non-API simple/transcript path:
+
+```bash
+youtube2md \
+  --url https://youtu.be/VIDEO_ID \
+  --extract-only \
+  --extract-format timestamped-text \
+  --captions-only \
+  --json \
+  --out ./summaries/VIDEO_ID.txt
+```
+
+This produces the timestamped `.txt` artifact and emits one JSON result envelope containing its `outputPath`, so wrappers do not need Python post-processing or directory scanning.
+
 ## Requirements
 
-- Node.js 18+
-- An active Codex ChatGPT login, or an OpenAI API key as a fallback
+- Node.js 20.18.1+
+- An OpenAI API key, or the optional Codex SDK with an active ChatGPT login
 - `OPENAI_API_KEY` is still required when caption retrieval fails and Whisper STT is needed
 
 ## Authentication priority
 
-Summarization providers are tried in this order:
+With `--provider auto`, summarization providers are tried in this order:
 
-1. **Codex SDK with ChatGPT login** — detected with the bundled Codex CLI and used without passing `OPENAI_API_KEY` to Codex.
+1. **Codex SDK with ChatGPT login** — used when the optional `@openai/codex-sdk` peer is installed and authenticated. `OPENAI_API_KEY` is not passed to Codex.
 2. **OpenAI API** — used only when Codex ChatGPT login is unavailable or Codex summarization fails.
 
 Log in to Codex once, then run `youtube2md` normally:
@@ -90,7 +140,7 @@ codex login status
 youtube2md --url https://youtu.be/VIDEO_ID
 ```
 
-Only a ChatGPT-authenticated Codex session is preferred. A Codex session authenticated with an API key is not treated as the keyless Codex path.
+Only a ChatGPT-authenticated Codex session is preferred. A Codex session authenticated with an API key is not treated as the keyless Codex path. Use `--provider codex` or `--provider openai` to disable automatic provider fallback.
 
 ## Environment variables
 
@@ -110,7 +160,7 @@ youtube2md --url https://youtu.be/VIDEO_ID
 
 Or create a `.env` file in your working directory:
 
-```
+```dotenv
 OPENAI_API_KEY=sk-...
 # YOUTUBE_COOKIES_PATH=./cookies.youtube.json
 ```
@@ -149,11 +199,14 @@ One paragraph overview of the video content.
 
 The transcript source line is included only when the caption fallbacks were unavailable and Whisper STT produced the transcript.
 
-### JSON (extract-only)
+### JSON transcript artifact (extract-only)
 
 ```json
 {
+  "schemaVersion": 1,
   "ok": true,
+  "mode": "extract",
+  "extractFormat": "json",
   "videoId": "VIDEO_ID",
   "metadata": {
     "videoId": "VIDEO_ID",
@@ -163,34 +216,60 @@ The transcript source line is included only when the caption fallbacks were unav
     "nativeChapters": []
   },
   "transcriptSource": "youtube-captions",
+  "actualLanguage": "en",
+  "autoGeneratedCaptions": false,
   "segments": [
     { "text": "Hello world", "startSeconds": 0.0, "durationSeconds": 2.4 }
   ]
 }
 ```
 
-### JSON (full pipeline with `--json`)
+### Timestamped text (extract-only)
+
+```text
+[0:00] Hello world
+[0:02] This line keeps its source timestamp
+```
+
+### JSON result envelope (`--json`, file output)
 
 ```json
 {
+  "schemaVersion": 1,
   "ok": true,
+  "mode": "full",
   "videoId": "VIDEO_ID",
   "metadata": { "..." },
   "transcriptSource": "whisper",
+  "actualLanguage": "en",
+  "autoGeneratedCaptions": null,
+  "provider": "openai",
+  "fallbackUsed": false,
   "outputPath": "/path/to/summaries/VIDEO_ID.md"
 }
 ```
+
+Extract file mode uses the same envelope with `mode: "extract"`, `extractFormat`, and `outputPath`. Full `--json --stdout` adds `markdown`; text extract `--json --stdout` adds `text`. JSON transcript stdout keeps `segments` at the top level for straightforward streaming consumers.
 
 ### Error JSON
 
 All errors emit a structured object when `--json` is active:
 
 ```json
-{ "ok": false, "code": "E_TRANSCRIPT_UNAVAILABLE", "message": "..." }
+{
+  "schemaVersion": 1,
+  "ok": false,
+  "mode": "extract",
+  "code": "E_TRANSCRIPT_UNAVAILABLE",
+  "message": "..."
+}
 ```
 
 | Code | Cause |
 |---|---|
+| `E_INVALID_INPUT` | Missing or invalid CLI argument |
+| `E_UNSUPPORTED_URL` | Unsupported YouTube URL shape or invalid video ID |
+| `E_VIDEO_UNAVAILABLE` | Video is private, deleted, age-restricted, or otherwise unavailable |
 | `E_TRANSCRIPT_UNAVAILABLE` | No captions found and Whisper fallback unavailable |
 | `E_SUMMARIZER_UNAVAILABLE` | Neither Codex SDK nor the OpenAI API fallback could summarize |
 | `E_OPENAI_AUTH` | The configured `OPENAI_API_KEY` fallback is invalid |
@@ -198,6 +277,7 @@ All errors emit a structured object when `--json` is active:
 | `E_WHISPER_FAILED` | Whisper STT transcription failed |
 | `E_NETWORK` | Network or YouTube access error |
 | `E_WRITE_FAILED` | Could not write output file |
+| `E_UNKNOWN` | Unexpected unclassified failure |
 
 ## Transcript strategy
 
@@ -205,7 +285,9 @@ The tool tries these methods in order:
 
 1. **YouTube captions via watch-page / InnerTube requests** — uses caption tracks directly and applies configured YouTube cookies when available (supports `json3` and XML timedtext formats)
 2. **`youtube-transcript` fallback** — retries with an alternate parser path
-3. **OpenAI Whisper STT fallback** — resolves a directly downloadable audio-only stream through the Android InnerTube player, downloads it, and transcribes it with `whisper-1` segment timestamps (requires `OPENAI_API_KEY`; audio must be under 25 MB). The resulting JSON records `transcriptSource: "whisper"`, and full Markdown output adds a Whisper source notice. Skipped when no API key is set.
+3. **OpenAI Whisper STT fallback** — resolves a directly downloadable audio-only stream through the Android InnerTube player, downloads it, and transcribes it with `whisper-1` segment timestamps (requires `OPENAI_API_KEY`; audio must be under 25 MB). The resulting JSON records `transcriptSource: "whisper"`, and full Markdown output adds a Whisper source notice. Skipped when no API key is set or `--captions-only` is active.
+
+`--caption-lang` prefers an exact language-code match, then the same base language, then another available track. Machine-readable output always reports `actualLanguage` when YouTube or Whisper provides it.
 
 ## Summary process
 
@@ -277,7 +359,9 @@ npm run clean   # Remove dist/
 src/
 ├── index.ts             # Entry point — pipeline branching and orchestration
 ├── cli.ts               # CLI argument parsing (Commander)
+├── youtube-url.ts       # Strict YouTube URL parsing and video ID validation
 ├── youtube.ts           # Metadata fetch + transcript fetch with fallback
+├── transcript.ts        # Plain/timestamped transcript rendering
 ├── summary-provider.ts  # Codex-first provider selection and OpenAI adapter
 ├── summarizer.ts        # Provider-neutral prompting + JSON parsing
 ├── markdown.ts          # Markdown generation + file writing

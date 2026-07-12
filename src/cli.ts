@@ -1,15 +1,32 @@
 import { createRequire } from 'node:module';
-import { Command } from 'commander';
-import type { CliOptions } from './types.js';
+import { Command, CommanderError } from 'commander';
+import { AppError } from './types.js';
+import type {
+  CliOptions,
+  ExtractFormat,
+  ProviderPreference,
+} from './types.js';
+import { parseYouTubeUrl } from './youtube-url.js';
 
 const require = createRequire(import.meta.url);
 const { version } = require('../package.json') as { version: string };
+const PROVIDERS = new Set<ProviderPreference>(['auto', 'codex', 'openai']);
+const EXTRACT_FORMATS = new Set<ExtractFormat>([
+  'json',
+  'text',
+  'timestamped-text',
+]);
 
-/**
- * Parses process.argv and returns validated CLI options.
- * Exits with a user-friendly message on validation failure.
- */
-export function parseCli(): CliOptions {
+/** Signals that Commander already displayed help/version and no error occurred. */
+export class CliDisplayExit extends Error {
+  constructor(public readonly exitCode: number) {
+    super('CLI display completed.');
+    this.name = 'CliDisplayExit';
+  }
+}
+
+/** Parses and validates CLI arguments without directly terminating the process. */
+export function parseCli(argv: string[] = process.argv): CliOptions {
   const program = new Command();
 
   program
@@ -22,28 +39,45 @@ export function parseCli(): CliOptions {
       'Summary output language (default: same as transcript language)'
     )
     .option(
+      '--caption-lang <language_code>',
+      'Preferred caption language, such as en, ko, or pt-BR (falls back if unavailable)'
+    )
+    .option(
       '--model <model>',
-      'OpenAI model to use (default: gpt-5.6-luna)'
+      'Model to use for summarization (default: gpt-5.6-luna)'
+    )
+    .option(
+      '--provider <provider>',
+      'Summarization provider: auto, codex, or openai',
+      'auto'
     )
     .option(
       '--out <path>',
-      'Output file path (default: ./summaries/<video_id>.md)'
+      'Output file path (default: ./summaries/<video_id>.<ext>)'
     )
     .option(
       '--out-dir <dir>',
-      'Output directory; file is named <video_id>.md (default: ./summaries)'
+      'Output directory; file is named <video_id>.<ext> (default: ./summaries)'
     )
     .option(
       '--extract-only',
-      'Skip summarization and output raw transcript data as JSON'
+      'Skip summarization and output transcript data'
+    )
+    .option(
+      '--extract-format <format>',
+      'Extract artifact format: json, text, or timestamped-text (default: json)'
+    )
+    .option(
+      '--captions-only',
+      'Use YouTube captions only; never send audio to Whisper'
     )
     .option(
       '--json',
-      'Emit results as JSON (machine-readable); errors also output as JSON'
+      'Emit a versioned JSON result envelope; errors also output as JSON'
     )
     .option(
       '--stdout',
-      'Write output to stdout instead of a file'
+      'Write content to stdout instead of a file'
     )
     .addHelpText(
       'after',
@@ -51,58 +85,100 @@ export function parseCli(): CliOptions {
 Examples:
   $ youtube2md --url https://www.youtube.com/watch?v=dQw4w9WgXcQ
   $ youtube2md --url https://youtu.be/dQw4w9WgXcQ --out ./notes/video.md
-  $ youtube2md --url https://youtu.be/dQw4w9WgXcQ --lang English
+  $ youtube2md --url https://youtu.be/dQw4w9WgXcQ --lang English --provider openai
   $ youtube2md --url https://youtu.be/dQw4w9WgXcQ --extract-only --stdout
-  $ youtube2md --url https://youtu.be/dQw4w9WgXcQ --json --out-dir ./output
+  $ youtube2md --url https://youtu.be/dQw4w9WgXcQ --extract-only --extract-format timestamped-text
+  $ youtube2md --url https://youtu.be/dQw4w9WgXcQ --extract-only --captions-only --json
     `
     );
 
-  program.parse(process.argv);
+  program.exitOverride();
+  program.configureOutput({
+    // A single top-level handler owns all error output, including JSON mode.
+    writeErr: () => undefined,
+  });
+
+  try {
+    program.parse(argv);
+  } catch (err) {
+    if (err instanceof CommanderError) {
+      if (err.exitCode === 0) {
+        throw new CliDisplayExit(0);
+      }
+      throw new AppError('E_INVALID_INPUT', cleanCommanderMessage(err.message));
+    }
+    throw err;
+  }
 
   const opts = program.opts<{
     url: string;
     out?: string;
     outDir?: string;
     lang?: string;
+    captionLang?: string;
     model?: string;
+    provider: string;
     extractOnly?: boolean;
+    extractFormat?: string;
+    captionsOnly?: boolean;
     json?: boolean;
     stdout?: boolean;
   }>();
 
-  if (!isYouTubeUrl(opts.url)) {
-    console.error(
-      `Error: --url must be a valid YouTube URL.\n` +
-        `  Got: ${opts.url}\n` +
-        `  Expected: https://www.youtube.com/watch?v=... or https://youtu.be/...`
+  if (!PROVIDERS.has(opts.provider as ProviderPreference)) {
+    throw new AppError(
+      'E_INVALID_INPUT',
+      '--provider must be one of: auto, codex, openai.'
     );
-    process.exit(1);
   }
 
-  const language = opts.lang?.replace(/\s+/g, ' ').trim();
+  const extractFormat = (opts.extractFormat ?? 'json') as ExtractFormat;
+  if (!EXTRACT_FORMATS.has(extractFormat)) {
+    throw new AppError(
+      'E_INVALID_INPUT',
+      '--extract-format must be one of: json, text, timestamped-text.'
+    );
+  }
+  if (opts.extractFormat && !opts.extractOnly) {
+    throw new AppError(
+      'E_INVALID_INPUT',
+      '--extract-format can only be used with --extract-only.'
+    );
+  }
+
+  const language = normalizeWhitespace(opts.lang);
+  const captionLang = opts.captionLang?.trim();
+  if (captionLang && !/^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$/.test(captionLang)) {
+    throw new AppError(
+      'E_INVALID_INPUT',
+      '--caption-lang must be a language code such as en, ko, zh-Hant, or pt-BR.'
+    );
+  }
+
+  const { videoId } = parseYouTubeUrl(opts.url);
 
   return {
     url: opts.url,
+    videoId,
     out: opts.out,
     outDir: opts.outDir,
-    lang: language && language.length > 0 ? language : undefined,
+    lang: language,
+    captionLang,
     model: opts.model?.trim() || undefined,
+    provider: opts.provider as ProviderPreference,
+    extractFormat,
+    captionsOnly: opts.captionsOnly ?? false,
     extractOnly: opts.extractOnly ?? false,
     json: opts.json ?? false,
     stdout: opts.stdout ?? false,
   };
 }
 
-function isYouTubeUrl(url: string): boolean {
-  try {
-    const parsed = new URL(url);
-    return (
-      parsed.hostname === 'www.youtube.com' ||
-      parsed.hostname === 'youtube.com' ||
-      parsed.hostname === 'youtu.be' ||
-      parsed.hostname === 'm.youtube.com'
-    );
-  } catch {
-    return false;
-  }
+function normalizeWhitespace(value?: string): string | undefined {
+  const normalized = value?.replace(/\s+/g, ' ').trim();
+  return normalized || undefined;
+}
+
+function cleanCommanderMessage(message: string): string {
+  return message.replace(/^error:\s*/i, '').trim();
 }
