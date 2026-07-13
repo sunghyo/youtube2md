@@ -85,7 +85,10 @@ function resolveCodexCliEntry(): string {
 }
 
 function resolveCodexSdkEntry(): string {
-  return require.resolve('@openai/codex-sdk');
+  // The SDK is ESM-only (its exports map has only an "import" condition), so
+  // require.resolve() always throws ERR_PACKAGE_PATH_NOT_EXPORTED for it —
+  // which would misreport an installed SDK as missing.
+  return import.meta.resolve('@openai/codex-sdk');
 }
 
 /**

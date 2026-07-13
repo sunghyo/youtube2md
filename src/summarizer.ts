@@ -651,11 +651,6 @@ ${JSON.stringify(chunkPayload, null, 2)}
 Generate a final full-video summary and key takeaways as JSON.`;
 }
 
-function combineChunkChapters(chunkSummaries: ChunkSummary[]): Chapter[] {
-  const combinedChapters = chunkSummaries.flatMap((chunk) => chunk.result.chapters);
-  return normalizeChapters(combinedChapters);
-}
-
 async function summarizeChunksWithConcurrency(
   provider: SummaryProvider,
   model: string,
@@ -690,13 +685,16 @@ async function summarizeChunksWithConcurrency(
       );
 
       const chunkTargets = deriveChunkTargets(chunk);
+      // keepTimeMarkers: cross-chunk relocation happens in the final global
+      // normalization pass, which needs the markers intact to work.
       const chunkResult = await requestStructuredSummary(
         provider,
         model,
         `chunk ${chunk.index + 1}/${chunks.length}`,
         buildChunkSystemPrompt(chunkTargets, summaryLanguage),
         buildChunkUserPrompt(metadata, chunk, chunks.length),
-        { minSeconds: chunk.startSeconds, maxSeconds: chunk.endSeconds }
+        { minSeconds: chunk.startSeconds, maxSeconds: chunk.endSeconds },
+        true
       );
 
       results[currentIndex] = {
@@ -814,7 +812,8 @@ async function requestStructuredSummary(
   stage: string,
   instructions: string,
   input: string,
-  bounds?: SecondsBounds
+  bounds?: SecondsBounds,
+  keepTimeMarkers = false
 ): Promise<GptSummaryResponse> {
   try {
     const parsed = await withRetries(stage, async () => {
@@ -827,7 +826,7 @@ async function requestStructuredSummary(
       });
       return parseGptResponse(output);
     });
-    return normalizeSummary(parsed, bounds);
+    return normalizeSummary(parsed, bounds, keepTimeMarkers);
   } catch (err) {
     throw new Error(
       `${provider.name} request failed during ${stage} ` +
@@ -936,7 +935,10 @@ export async function summarizeWithProvider(
   );
 
   console.log(`Combining and merging chapters from ${chunkSummaries.length} chunk(s)...`);
-  const combinedChapters = combineChunkChapters(chunkSummaries);
+  // Raw concatenation only; the final normalizeSummary below runs the single
+  // global pass that merges duplicate boundaries, relocates leaked descriptions
+  // across chunks, and strips the inline time markers.
+  const combinedChapters = chunkSummaries.flatMap((chunk) => chunk.result.chapters);
 
   console.log('Generating final summary and takeaways from chunk summaries...');
   const finalSynthesis = await requestFinalSynthesis(
@@ -1084,24 +1086,25 @@ function normalizeTakeaways(items: string[]): string[] {
 
 /**
  * Parses a display timestamp ("M:SS" or "H:MM:SS") back to seconds. Returns
- * undefined for anything that isn't a 2- or 3-part colon-separated time, so the
- * caller can fall back to the model-provided numeric `seconds`.
+ * undefined for anything that isn't a well-formed 2- or 3-part time (trailing
+ * parts must be two digits, 00-59), so the caller can fall back to the
+ * model-provided numeric `seconds` instead of misreading e.g. a "3:2" ratio.
+ * Exported for tests.
  */
-function parseTimestampToSeconds(timestamp: string): number | undefined {
+export function parseTimestampToSeconds(timestamp: string): number | undefined {
   const parts = timestamp.trim().split(':');
   if (parts.length < 2 || parts.length > 3) {
+    return undefined;
+  }
+  if (!/^\d{1,2}$/.test(parts[0]) || !parts.slice(1).every((part) => /^[0-5]\d$/.test(part))) {
     return undefined;
   }
 
   let seconds = 0;
   for (const part of parts) {
-    const value = Number(part);
-    if (!Number.isFinite(value) || value < 0) {
-      return undefined;
-    }
-    seconds = seconds * 60 + value;
+    seconds = seconds * 60 + Number(part);
   }
-  return Math.round(seconds);
+  return seconds;
 }
 
 /**
@@ -1146,8 +1149,9 @@ function firstTimeMarkerSeconds(text: string): number | undefined {
  * and their formatting is consistent regardless of which chunk produced them.
  * Handles bracketed ("[12:34]"), parenthesized single/range ("(1:00~1:20)"), and
  * leading bare markers, including a trailing Korean particle ("26:58에서 …").
+ * Exported for tests.
  */
-function stripTimeMarkers(text: string): string {
+export function stripTimeMarkers(text: string): string {
   const bracketed = new RegExp(`\\[\\s*${TIME_TOKEN_SOURCE}\\s*\\]`, 'g');
   const parenthesized = new RegExp(
     `\\(\\s*${TIME_TOKEN_SOURCE}(?:\\s*[~\\-–]\\s*${TIME_TOKEN_SOURCE})?\\s*\\)`,
@@ -1172,8 +1176,14 @@ function stripTimeMarkers(text: string): string {
  * covers their time marker, then strips the markers. Preserves every description
  * — nothing is dropped for being mis-timed, only moved. Chapters must be sorted
  * by seconds ascending.
+ *
+ * `keepTimeMarkers` skips the stripping step. Chunk-level normalization must
+ * keep markers: a description leaked from the overlap context points at a time
+ * before the chunk's own window, and only the later global pass (which sees all
+ * chunks' chapters) can move it to the chapter that actually covers that time.
+ * Stripping here would erase the only evidence the global pass relies on.
  */
-function redistributeDescriptions(chapters: Chapter[]): void {
+function redistributeDescriptions(chapters: Chapter[], keepTimeMarkers = false): void {
   if (chapters.length === 0) {
     return;
   }
@@ -1223,12 +1233,21 @@ function redistributeDescriptions(chapters: Chapter[]): void {
       chapters[i].descriptions.push(...incoming[i]);
     }
     chapters[i].descriptions = Array.from(
-      new Set(chapters[i].descriptions.map(stripTimeMarkers).filter((text) => text !== ''))
+      new Set(
+        chapters[i].descriptions
+          .map((text) => (keepTimeMarkers ? text.trim() : stripTimeMarkers(text)))
+          .filter((text) => text !== '')
+      )
     );
   }
 }
 
-function normalizeChapters(chapters: Chapter[], bounds?: SecondsBounds): Chapter[] {
+/** Exported for tests. See `redistributeDescriptions` for `keepTimeMarkers`. */
+export function normalizeChapters(
+  chapters: Chapter[],
+  bounds?: SecondsBounds,
+  keepTimeMarkers = false
+): Chapter[] {
   const sortedChapters = chapters
     .map((chapter) => {
       // Derive seconds from the (transcript-copied) timestamp, clamp to the window,
@@ -1276,7 +1295,7 @@ function normalizeChapters(chapters: Chapter[], bounds?: SecondsBounds): Chapter
 
   // Relocate mis-timed descriptions to the chapter that covers their time, then
   // strip inline markers so every bullet reads as plain, consistently-formatted prose.
-  redistributeDescriptions(mergedChapters);
+  redistributeDescriptions(mergedChapters, keepTimeMarkers);
 
   const finalChapters = mergedChapters.filter((chapter) => chapter.descriptions.length > 0);
 
@@ -1320,10 +1339,11 @@ function titlesSimilar(a: string, b: string): boolean {
 
 function normalizeSummary(
   result: GptSummaryResponse,
-  bounds?: SecondsBounds
+  bounds?: SecondsBounds,
+  keepTimeMarkers = false
 ): GptSummaryResponse {
   const summary = result.summary.trim();
-  const dedupedChapters = normalizeChapters(result.chapters, bounds);
+  const dedupedChapters = normalizeChapters(result.chapters, bounds, keepTimeMarkers);
 
   const takeaways = normalizeTakeaways(result.takeaways);
 

@@ -13,7 +13,6 @@ import type {
   TranscriptResult,
   NativeChapter,
 } from './types.js';
-export { extractVideoId } from './youtube-url.js';
 
 // ─── Metadata ─────────────────────────────────────────────────────────────────
 
@@ -26,6 +25,11 @@ export async function fetchVideoMetadata(videoId: string): Promise<VideoMetadata
   try {
     info = await ytdl.getBasicInfo(buildVideoUrl(videoId), getYtdlRequestOptions());
   } catch (err) {
+    // Configuration errors (e.g. a broken cookie file) already carry an accurate
+    // code and message; re-wrapping them would misreport the video as unavailable.
+    if (err instanceof AppError) {
+      throw err;
+    }
     const details = String(err);
     throw new AppError(
       looksLikeNetworkError(details) ? 'E_NETWORK' : 'E_VIDEO_UNAVAILABLE',
@@ -48,7 +52,8 @@ export async function fetchVideoMetadata(videoId: string): Promise<VideoMetadata
   return {
     videoId,
     title: details.title,
-    duration: formatSeconds(totalSeconds),
+    // lengthSeconds can be missing/non-numeric for live or premiere content.
+    duration: Number.isFinite(totalSeconds) ? formatSeconds(totalSeconds) : 'Unknown',
     publishDate: (details.publishDate ?? details.uploadDate ?? 'Unknown').slice(0, 10),
     description: (details.description ?? '').trim(),
     nativeChapters,
@@ -126,7 +131,9 @@ interface YouTubeAuthContext {
   sourceLabel: string;
 }
 
-const MAX_WHISPER_FILE_BYTES = 24 * 1024 * 1024;
+// Kept below Whisper's 25MB request cap to leave headroom for upload overhead.
+const MAX_WHISPER_FILE_MB = 24;
+const MAX_WHISPER_FILE_BYTES = MAX_WHISPER_FILE_MB * 1024 * 1024;
 const ANDROID_CLIENT_VERSION = '20.10.38';
 const ANDROID_OS_VERSION = '14';
 
@@ -433,9 +440,9 @@ function languageMatchRank(actual: string, preferred: string): number {
 }
 
 /**
- * Parses YouTube json3 timedtext payloads.
+ * Parses YouTube json3 timedtext payloads. Exported for tests.
  */
-function parseCaptionJson3(payload: string): TranscriptSegment[] {
+export function parseCaptionJson3(payload: string): TranscriptSegment[] {
   let parsed: unknown;
   try {
     parsed = JSON.parse(payload);
@@ -495,11 +502,11 @@ function parseCaptionJson3(payload: string): TranscriptSegment[] {
 }
 
 /**
- * Parses YouTube timedtext XML formats:
+ * Parses YouTube timedtext XML formats. Exported for tests.
  * - srv3 style: <p t="ms" d="ms">...</p>
  * - legacy style: <text start="seconds" dur="seconds">...</text>
  */
-function parseTimedTextXml(xml: string): TranscriptSegment[] {
+export function parseTimedTextXml(xml: string): TranscriptSegment[] {
   const paragraphSegments = parseTimedTextElements(xml, {
     tag: 'p',
     startAttr: 't',
@@ -562,7 +569,9 @@ function parseTimedTextElements(
 
 function getXmlAttribute(attrs: string, attrName: string): string | undefined {
   const escapedName = attrName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const match = attrs.match(new RegExp(`${escapedName}="([^"]+)"`));
+  // The leading boundary keeps short names like "t" from matching inside other
+  // attribute names (e.g. `at="…"`).
+  const match = attrs.match(new RegExp(`(?:^|\\s)${escapedName}="([^"]+)"`));
   return match?.[1];
 }
 
@@ -579,7 +588,8 @@ function extractXmlCaptionText(inner: string): string {
   return normalizeTranscriptText(decodeHtmlEntities(withoutTags));
 }
 
-function decodeHtmlEntities(input: string): string {
+/** Exported for tests. */
+export function decodeHtmlEntities(input: string): string {
   return input.replace(/&(#\d+|#x[0-9a-fA-F]+|[a-zA-Z]+);/g, (full, entity: string) => {
     if (entity.startsWith('#x') || entity.startsWith('#X')) {
       const codePoint = Number.parseInt(entity.slice(2), 16);
@@ -615,7 +625,6 @@ function decodeHtmlEntities(input: string): string {
       case 'quot':
         return '"';
       case 'apos':
-      case '#39':
         return '\'';
       case 'nbsp':
         return ' ';
@@ -654,12 +663,12 @@ async function fetchTranscriptViaWhisper(
     );
     await downloadAudioToFile(audioFormat, tmpFile);
 
-    // Check file size — Whisper rejects files larger than 25MB
     const stats = fs.statSync(tmpFile);
     const sizeMB = stats.size / (1024 * 1024);
     if (stats.size > MAX_WHISPER_FILE_BYTES) {
       throw new Error(
-        `Audio file is ${sizeMB.toFixed(1)}MB, exceeding Whisper's 25MB limit.\n` +
+        `Audio file is ${sizeMB.toFixed(1)}MB, exceeding the ${MAX_WHISPER_FILE_MB}MB ` +
+          `upload limit (kept below Whisper's 25MB cap).\n` +
           `Consider using a YouTube video with captions enabled.`
       );
     }
@@ -727,7 +736,7 @@ async function downloadAudioToFile(
     await response.body.cancel();
     throw new Error(
       `Audio download is ${(responseSize / (1024 * 1024)).toFixed(1)}MB, ` +
-        `exceeding Whisper's 25MB limit.`
+        `exceeding the ${MAX_WHISPER_FILE_MB}MB upload limit (kept below Whisper's 25MB cap).`
     );
   }
 
@@ -917,8 +926,8 @@ function getYouTubeAuthContext(): YouTubeAuthContext | null {
 
   const cookieFilePath = process.env['YOUTUBE_COOKIES_PATH']?.trim();
   if (cookieFilePath) {
-    cachedYouTubeAuthContext = createYouTubeAuthContext(
-      loadCookiesFromFile(cookieFilePath),
+    cachedYouTubeAuthContext = buildYouTubeAuthContext(
+      () => loadCookiesFromFile(cookieFilePath),
       'YOUTUBE_COOKIES_PATH'
     );
     return cachedYouTubeAuthContext;
@@ -926,8 +935,8 @@ function getYouTubeAuthContext(): YouTubeAuthContext | null {
 
   const cookieHeader = process.env['YOUTUBE_COOKIE_HEADER']?.trim();
   if (cookieHeader) {
-    cachedYouTubeAuthContext = createYouTubeAuthContext(
-      parseCookieHeader(cookieHeader),
+    cachedYouTubeAuthContext = buildYouTubeAuthContext(
+      () => parseCookieHeader(cookieHeader),
       'YOUTUBE_COOKIE_HEADER'
     );
     return cachedYouTubeAuthContext;
@@ -935,6 +944,22 @@ function getYouTubeAuthContext(): YouTubeAuthContext | null {
 
   cachedYouTubeAuthContext = null;
   return cachedYouTubeAuthContext;
+}
+
+/**
+ * Wraps cookie-loading failures in E_INVALID_INPUT so a broken cookie file or
+ * header fails fast as a configuration error instead of surfacing later as a
+ * misleading E_VIDEO_UNAVAILABLE.
+ */
+function buildYouTubeAuthContext(
+  loadCookies: () => BrowserCookie[],
+  sourceLabel: string
+): YouTubeAuthContext {
+  try {
+    return createYouTubeAuthContext(loadCookies(), sourceLabel);
+  } catch (err) {
+    throw new AppError('E_INVALID_INPUT', err instanceof Error ? err.message : String(err));
+  }
 }
 
 function createYouTubeAuthContext(

@@ -213,6 +213,7 @@ The transcript source line is included only when the caption fallbacks were unav
     "title": "Video Title",
     "duration": "12:34",
     "publishDate": "2024-01-01",
+    "description": "Full video description text.",
     "nativeChapters": []
   },
   "transcriptSource": "youtube-captions",
@@ -285,7 +286,7 @@ The tool tries these methods in order:
 
 1. **YouTube captions via watch-page / InnerTube requests** — uses caption tracks directly and applies configured YouTube cookies when available (supports `json3` and XML timedtext formats)
 2. **`youtube-transcript` fallback** — retries with an alternate parser path
-3. **OpenAI Whisper STT fallback** — resolves a directly downloadable audio-only stream through the Android InnerTube player, downloads it, and transcribes it with `whisper-1` segment timestamps (requires `OPENAI_API_KEY`; audio must be under 25 MB). The resulting JSON records `transcriptSource: "whisper"`, and full Markdown output adds a Whisper source notice. Skipped when no API key is set or `--captions-only` is active.
+3. **OpenAI Whisper STT fallback** — resolves a directly downloadable audio-only stream through the Android InnerTube player, downloads it, and transcribes it with `whisper-1` segment timestamps (requires `OPENAI_API_KEY`; audio must be under 24 MB, a safety margin below Whisper's 25 MB cap). The resulting JSON records `transcriptSource: "whisper"`, and full Markdown output adds a Whisper source notice. Skipped when no API key is set or `--captions-only` is active.
 
 `--caption-lang` prefers an exact language-code match, then the same base language, then another available track. Machine-readable output always reports `actualLanguage` when YouTube or Whisper provides it.
 

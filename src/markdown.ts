@@ -51,17 +51,6 @@ export function generateMarkdown(data: SummaryData): string {
 }
 
 /**
- * Resolves the output file path from CLI --out option or default pattern.
- * Default: ./summaries/<videoId>.md relative to cwd.
- */
-export function resolveOutputPath(videoId: string, outOption?: string): string {
-  if (outOption) {
-    return path.resolve(outOption);
-  }
-  return path.resolve(process.cwd(), 'summaries', `${videoId}.md`);
-}
-
-/**
  * Writes Markdown content to disk, creating parent directories as needed.
  */
 export function writeMarkdownFile(filePath: string, content: string): void {

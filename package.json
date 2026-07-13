@@ -30,7 +30,8 @@
     "build": "tsc && chmod +x dist/index.js",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js",
-    "test": "tsx --test src/__tests__/*.test.ts",
+    "typecheck": "tsc -p tsconfig.test.json",
+    "test": "npm run typecheck && tsx --test src/__tests__/*.test.ts",
     "clean": "rm -rf dist",
     "prepublishOnly": "npm test && npm run build"
   },
