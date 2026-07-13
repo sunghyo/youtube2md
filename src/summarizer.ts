@@ -73,7 +73,6 @@ interface OutputTargets {
 interface ChunkTargets {
   summarySentences: string;
   chapterCount: string;
-  descriptionCount: string;
   takeawayCount: string;
 }
 
@@ -371,7 +370,6 @@ function deriveChunkTargets(chunk: TranscriptChunk): ChunkTargets {
 
   return {
     chapterCount: formatRange(chapterMin, chapterMax),
-    descriptionCount: '3-6',
     takeawayCount: formatRange(takeawayMin, takeawayMax),
     summarySentences: formatRange(summaryMin, summaryMax),
   };
@@ -487,7 +485,7 @@ Rules:
 - Detect between ${targets.chapterCount} meaningful chapter boundaries based on topic shifts
 - If native YouTube chapters are provided, treat them as strong hints but you may add or refine them
 - timestamps must be actual times from the transcript (do not invent times); copy the [H:MM:SS] value exactly and set "seconds" to its integer equivalent
-- Each chapter must include 3 to 5 entries in "descriptions"
+- Decide the number of "descriptions" per chapter yourself, by importance and information density: one entry per distinct fact, claim, example, or step made in the section. A dense section deserves many entries; a thin or transitional one may need only one or two. Never drop a concrete detail to keep the list short.
 - Each description must preserve concrete specifics from the transcript: numbers, prices, measurements, names, product/model names, dates, examples, and comparisons. Do not generalize away figures or proper nouns.
 - Write descriptions as plain prose. Do NOT put any timestamp, time range, or bracketed time (e.g. "[12:34]", "(1:00~1:20)") inside description text — the chapter's "timestamp"/"seconds" fields already mark the time
 - If the transcript contains obvious speech-to-text errors (misheard names, wrong homophones, garbled proper nouns), silently correct them to the most likely intended term from context; do not quote or flag the garbled version
@@ -544,7 +542,7 @@ The JSON must conform exactly to this schema:
 Rules:
 - Use only information present in this chunk
 - Detect between ${targets.chapterCount} meaningful chapter boundaries inside this chunk
-- Each chapter must include ${targets.descriptionCount} entries in "descriptions"
+- Decide the number of "descriptions" per chapter yourself, by importance and information density: one entry per distinct fact, claim, example, or step made in the section. A dense section deserves many entries; a thin or transitional one may need only one or two. Never drop a concrete detail to keep the list short.
 - Each description must preserve concrete specifics from the transcript: numbers, prices, measurements, names, product/model names, dates, examples, comparisons, and step-by-step details. Do not generalize away figures or proper nouns.
 - Prefer several precise descriptions over one vague sentence; do not merge distinct facts into a single bullet
 - Base every chapter, description, and takeaway ONLY on the TRANSCRIPT CHUNK section; never draw content from the PRECEDING CONTEXT lines (they exist only so you understand what came before)
@@ -871,14 +869,14 @@ async function requestFinalSynthesis(
  * @param provider - Structured summary provider (Codex SDK or OpenAI API)
  * @param segments - Normalized transcript segments
  * @param metadata - Video metadata including native chapters
- * @param model    - GPT model ID (default: gpt-5.6-luna)
+ * @param model    - GPT model ID (resolved per provider by resolveSummaryModel)
  * @param summaryLanguage - Optional output language override
  */
 export async function summarizeWithProvider(
   provider: SummaryProvider,
   segments: TranscriptSegment[],
   metadata: VideoMetadata,
-  model: string = 'gpt-5.6-luna',
+  model: string,
   summaryLanguage?: string
 ): Promise<GptSummaryResponse> {
   if (segments.length === 0) {

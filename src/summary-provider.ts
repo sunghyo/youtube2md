@@ -26,6 +26,32 @@ export interface CodexAvailability {
 
 const require = createRequire(import.meta.url);
 const CODEX_LOGIN_TIMEOUT_MS = 5_000;
+
+export const DEFAULT_OPENAI_MODEL = 'gpt-5.6-luna';
+// The Codex/ChatGPT backend has its own model catalog that rotates
+// independently of the OpenAI API. If this default starts 404-ing on the
+// ChatGPT backend (pushing runs onto the billed API fallback), point
+// CODEX_MODEL at a supported model instead of editing the shared default.
+export const DEFAULT_CODEX_MODEL = 'gpt-5.6-luna';
+
+/**
+ * Resolves the model for a provider. An explicit --model wins for both
+ * providers; otherwise each provider has its own env override and default,
+ * because the Codex/ChatGPT backend and the OpenAI API expose different
+ * model catalogs.
+ */
+export function resolveSummaryModel(
+  kind: SummaryProvider['kind'],
+  explicitModel?: string
+): string {
+  if (explicitModel) {
+    return explicitModel;
+  }
+  if (kind === 'codex') {
+    return process.env['CODEX_MODEL']?.trim() || DEFAULT_CODEX_MODEL;
+  }
+  return process.env['OPENAI_MODEL']?.trim() || DEFAULT_OPENAI_MODEL;
+}
 const CODEX_SAFE_ENV_KEYS = new Set([
   'ALL_PROXY',
   'APPDATA',

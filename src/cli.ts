@@ -44,7 +44,8 @@ export function parseCli(argv: string[] = process.argv): CliOptions {
     )
     .option(
       '--model <model>',
-      'Model to use for summarization (default: gpt-5.6-luna)'
+      'Model for summarization; applies to whichever provider runs ' +
+        '(default: gpt-5.6-luna; per-provider overrides: CODEX_MODEL, OPENAI_MODEL)'
     )
     .option(
       '--provider <provider>',

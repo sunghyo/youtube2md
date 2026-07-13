@@ -12,6 +12,7 @@ import { summarizeWithProvider } from './summarizer.js';
 import {
   createCodexSummaryProvider,
   createOpenAiSummaryProvider,
+  resolveSummaryModel,
   detectCodexChatGptLogin,
   type SummaryProvider,
 } from './summary-provider.js';
@@ -227,7 +228,6 @@ async function configureSummaryProviders(
 async function runFullPipeline(opts: CliOptions): Promise<void> {
   const apiKey = process.env['OPENAI_API_KEY']?.trim();
   const openai = apiKey ? new OpenAI({ apiKey }) : null;
-  const model = opts.model ?? process.env['OPENAI_MODEL'] ?? 'gpt-5.6-luna';
   const providerSetup = await configureSummaryProviders(opts, openai);
   const { videoId } = opts;
 
@@ -264,6 +264,7 @@ async function runFullPipeline(opts: CliOptions): Promise<void> {
   const providerFailures: Array<{ provider: SummaryProvider; error: unknown }> = [];
 
   for (const [index, provider] of providerSetup.providers.entries()) {
+    const model = resolveSummaryModel(provider.kind, opts.model);
     console.log(`Summarization provider: ${provider.name}`);
     try {
       gptResult = await summarizeWithProvider(

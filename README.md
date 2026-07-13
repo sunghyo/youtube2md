@@ -87,7 +87,7 @@ Supported URL shapes include `watch?v=`, `youtu.be`, Shorts, Live, Embed, Music,
 | Option | Description |
 |---|---|
 | `--url <youtube_url>` | YouTube video URL (required) |
-| `--model <model>` | Summarization model (default: `gpt-5.6-luna`). Overrides `OPENAI_MODEL`. |
+| `--model <model>` | Summarization model for whichever provider runs (default: `gpt-5.6-luna` for both providers; override per provider with `CODEX_MODEL` / `OPENAI_MODEL`). |
 | `--lang <language>` | Summary output language (default: same as transcript language) |
 | `--caption-lang <code>` | Preferred caption language such as `en`, `ko`, or `pt-BR`; falls back if unavailable |
 | `--provider <provider>` | `auto`, `codex`, or `openai` (default: `auto`) |
@@ -147,7 +147,8 @@ Only a ChatGPT-authenticated Codex session is preferred. A Codex session authent
 | Variable | Description |
 |---|---|
 | `OPENAI_API_KEY` | Optional summarization fallback; also enables Whisper STT when captions are unavailable. |
-| `OPENAI_MODEL` | Optional. Fallback model if `--model` is not passed (default: `gpt-5.6-luna`). |
+| `OPENAI_MODEL` | Optional. OpenAI API model if `--model` is not passed (default: `gpt-5.6-luna`). Does not affect the Codex provider. |
+| `CODEX_MODEL` | Optional. Codex (ChatGPT login) model if `--model` is not passed (default: `gpt-5.6-luna`). The Codex backend's model catalog changes independently of the OpenAI API; if the default starts failing there, set a supported model here. |
 | `YOUTUBE_COOKIES_PATH` | Optional. Path to an EditThisCookie JSON export for `youtube.com`. Used for metadata, captions, and audio fallback requests. |
 | `YOUTUBE_COOKIE_HEADER` | Optional. Raw `Cookie` header string for `youtube.com` requests. Useful when you already have a browser request cookie string. |
 
