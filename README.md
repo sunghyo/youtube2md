@@ -91,6 +91,7 @@ Supported URL shapes include `watch?v=`, `youtu.be`, Shorts, Live, Embed, Music,
 | `--lang <language>` | Summary output language (default: same as transcript language) |
 | `--caption-lang <code>` | Preferred caption language such as `en`, `ko`, or `pt-BR`; falls back if unavailable |
 | `--provider <provider>` | `auto`, `codex`, or `openai` (default: `auto`) |
+| `--detail <level>` | Summary detail density: `concise`, `balanced`, or `exhaustive` (default: `balanced`) |
 | `--out <path>` | Output file path |
 | `--out-dir <dir>` | Output directory; file is named `<video_id>.<ext>` (default: `./summaries`) |
 | `--extract-only` | Skip summarization and output transcript data |
@@ -307,12 +308,22 @@ The tool first attempts the Codex SDK with an active ChatGPT login. If that path
    - Split into chunks targeting `5000` tokens, snapping boundaries to natural break points (native chapter starts or speech pauses) once a chunk is soft-filled, so a topic isn't cut mid-sentence.
    - Merge tiny final chunk (`< 25%` of limit) into the previous chunk.
    - Carry a short **read-only overlap** from the previous section into each chunk for context.
-   - Give each chunk the video description and full chapter outline, and scale its output targets (chapters / descriptions / takeaways) to the amount of content it holds.
+   - Give each chunk the video description and full chapter outline, and scale its output targets (chapters / descriptions / takeaways) to the amount of content it holds — descriptions are asked for as a **variable target band** (e.g. `18-31`) proportional to transcript volume, so total detail grows with video length while the exact count still flexes with content density.
    - Summarize each chunk in parallel (up to 4 concurrent jobs).
    - Combine chapters locally, merging near-in-time boundary duplicates that adjacent chunks emit.
-   - One final GPT request for full-video summary and takeaways.
-6. **Structured output + validation**: Codex SDK requests use `outputSchema`; OpenAI Responses API requests use strict `json_schema`. Transient failures retry with exponential backoff. Chapter times are resolved from the (transcript-copied) timestamp, clamped to their section's window, and re-rendered so display and `?t=` link always agree.
+   - One final GPT request for full-video summary and takeaways. Summary paragraph/sentence and takeaway targets scale continuously with video duration (a 3-hour video gets a multi-paragraph chronological overview, not the same paragraph a 30-minute video gets).
+6. **Structured output + validation**: Codex SDK requests use `outputSchema`; OpenAI Responses API requests use strict `json_schema`. Transient failures retry with exponential backoff. A response that falls below the low end of the requested description band is re-requested once with an escalated prompt, keeping whichever attempt is more detailed (the band's ceiling is steered by the prompt, so this never forces extra verbosity). Chapter times are resolved from the (transcript-copied) timestamp, clamped to their section's window, and re-rendered so display and `?t=` link always agree.
 7. **Render Markdown**: convert to final output.
+
+### Detail level
+
+`--detail` controls how densely the transcript is mined for bullets and chapters. The count still scales with video length and content density at every level — the flag only shifts the target band:
+
+| Level | Density (≈ tokens per bullet) | Use when |
+|---|---|---|
+| `concise` | ~360 | You want a quick overview; minor points merged or dropped |
+| `balanced` (default) | ~210 | Substantive facts kept, filler/small-talk dropped |
+| `exhaustive` | ~120 | Near transcript-replacement; every distinct fact captured |
 
 ### Token thresholds & tuning
 
@@ -327,6 +338,8 @@ Defined in `src/summarizer.ts`:
 | `SPEECH_GAP_BREAK_SECONDS` | `2.5` | Silent gap treated as a topic break |
 | `CHUNK_OVERLAP_RATIO` | `0.12` | Leading read-only overlap carried into each chunk |
 | `MAX_API_ATTEMPTS` | `3` | Attempts per GPT request before giving up |
+| `DETAIL_PROFILES` | per level | Tokens-per-description / per-chapter density and tone for each `--detail` level |
+| `DETAIL_RETRY_THRESHOLD` | `0.7` | Escalate once if a response falls below this fraction of the description band's floor |
 
 ---
 

@@ -42,6 +42,28 @@ test('parses explicit provider selection', () => {
   assert.equal(options.provider, 'openai');
 });
 
+test('defaults detail to balanced and parses an explicit level', () => {
+  const defaulted = parseCli(['node', 'youtube2md', '--url', VIDEO_URL]);
+  assert.equal(defaulted.detail, 'balanced');
+
+  const explicit = parseCli([
+    'node',
+    'youtube2md',
+    '--url',
+    VIDEO_URL,
+    '--detail',
+    'exhaustive',
+  ]);
+  assert.equal(explicit.detail, 'exhaustive');
+});
+
+test('rejects an invalid detail level', () => {
+  const error = captureAppError(() =>
+    parseCli(['node', 'youtube2md', '--url', VIDEO_URL, '--detail', 'verbose'])
+  );
+  assert.equal(error.code, 'E_INVALID_INPUT');
+});
+
 test('turns missing required input into E_INVALID_INPUT', () => {
   const error = captureAppError(() => parseCli(['node', 'youtube2md', '--json']));
   assert.equal(error.code, 'E_INVALID_INPUT');

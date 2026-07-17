@@ -33,6 +33,14 @@ export type ExtractFormat = 'json' | 'text' | 'timestamped-text';
 /** Summarization provider selection policy. */
 export type ProviderPreference = 'auto' | 'codex' | 'openai';
 
+/**
+ * How densely to extract detail. Controls the target number of description
+ * bullets (and chapters) per unit of transcript, from a terse overview to a
+ * near-exhaustive transcript-replacement. The count still scales with video
+ * length and content density at every level — this only shifts the band.
+ */
+export type DetailLevel = 'concise' | 'balanced' | 'exhaustive';
+
 /** Public CLI pipeline mode used in machine-readable output. */
 export type PipelineMode = 'full' | 'extract';
 
@@ -153,6 +161,8 @@ export interface CliOptions {
   captionLang?: string;
   model?: string;
   provider: ProviderPreference;
+  /** Detail density of the summary (bullets/chapters per unit of transcript). */
+  detail: DetailLevel;
   extractFormat: ExtractFormat;
   /** Never send audio to Whisper; fail if caption retrieval is unavailable. */
   captionsOnly: boolean;

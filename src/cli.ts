@@ -3,6 +3,7 @@ import { Command, CommanderError } from 'commander';
 import { AppError } from './types.js';
 import type {
   CliOptions,
+  DetailLevel,
   ExtractFormat,
   ProviderPreference,
 } from './types.js';
@@ -11,6 +12,7 @@ import { parseYouTubeUrl } from './youtube-url.js';
 const require = createRequire(import.meta.url);
 const { version } = require('../package.json') as { version: string };
 const PROVIDERS = new Set<ProviderPreference>(['auto', 'codex', 'openai']);
+const DETAIL_LEVELS = new Set<DetailLevel>(['concise', 'balanced', 'exhaustive']);
 const EXTRACT_FORMATS = new Set<ExtractFormat>([
   'json',
   'text',
@@ -53,6 +55,11 @@ export function parseCli(argv: string[] = process.argv): CliOptions {
       'auto'
     )
     .option(
+      '--detail <level>',
+      'Summary detail density: concise, balanced, or exhaustive',
+      'balanced'
+    )
+    .option(
       '--out <path>',
       'Output file path (default: ./summaries/<video_id>.<ext>)'
     )
@@ -87,6 +94,8 @@ Examples:
   $ youtube2md --url https://www.youtube.com/watch?v=dQw4w9WgXcQ
   $ youtube2md --url https://youtu.be/dQw4w9WgXcQ --out ./notes/video.md
   $ youtube2md --url https://youtu.be/dQw4w9WgXcQ --lang English --provider openai
+  $ youtube2md --url https://youtu.be/dQw4w9WgXcQ --detail exhaustive
+  $ youtube2md --url https://youtu.be/dQw4w9WgXcQ --detail concise
   $ youtube2md --url https://youtu.be/dQw4w9WgXcQ --extract-only --stdout
   $ youtube2md --url https://youtu.be/dQw4w9WgXcQ --extract-only --extract-format timestamped-text
   $ youtube2md --url https://youtu.be/dQw4w9WgXcQ --extract-only --captions-only --json
@@ -119,6 +128,7 @@ Examples:
     captionLang?: string;
     model?: string;
     provider: string;
+    detail: string;
     extractOnly?: boolean;
     extractFormat?: string;
     captionsOnly?: boolean;
@@ -130,6 +140,13 @@ Examples:
     throw new AppError(
       'E_INVALID_INPUT',
       '--provider must be one of: auto, codex, openai.'
+    );
+  }
+
+  if (!DETAIL_LEVELS.has(opts.detail as DetailLevel)) {
+    throw new AppError(
+      'E_INVALID_INPUT',
+      '--detail must be one of: concise, balanced, exhaustive.'
     );
   }
 
@@ -167,6 +184,7 @@ Examples:
     captionLang,
     model: opts.model?.trim() || undefined,
     provider: opts.provider as ProviderPreference,
+    detail: opts.detail as DetailLevel,
     extractFormat,
     captionsOnly: opts.captionsOnly ?? false,
     extractOnly: opts.extractOnly ?? false,

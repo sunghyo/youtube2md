@@ -258,6 +258,7 @@ async function runFullPipeline(opts: CliOptions): Promise<void> {
   } else {
     console.log('Summary language: same as transcript');
   }
+  console.log(`Detail level: ${opts.detail}`);
 
   let gptResult: Awaited<ReturnType<typeof summarizeWithProvider>> | undefined;
   let selectedProvider: SummaryProvider | undefined;
@@ -272,7 +273,8 @@ async function runFullPipeline(opts: CliOptions): Promise<void> {
         segments,
         metadata,
         model,
-        opts.lang
+        opts.lang,
+        opts.detail
       );
       selectedProvider = provider;
       break;
