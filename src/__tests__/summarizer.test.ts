@@ -27,42 +27,43 @@ function formatSecondsForTest(seconds: number): string {
   return `${m}:${String(s).padStart(2, '0')}`;
 }
 
-test('relocates overlap-leaked descriptions across chunks in the global pass', () => {
-  // Chunk-level normalization (keepTimeMarkers = true) must preserve the inline
-  // time marker so the later global pass can move the description to the chunk
-  // that actually covers that time.
-  const chunk1 = normalizeChapters(
-    [
-      chapter({ seconds: 0, title: 'Intro topic', descriptions: ['Point about the intro.'] }),
-      chapter({ seconds: 180, title: 'Second topic', descriptions: ['Second point.'] }),
-    ],
-    { minSeconds: 0, maxSeconds: 300 },
-    true
-  );
-  const chunk2 = normalizeChapters(
-    [
-      chapter({
-        seconds: 300,
-        title: 'Third topic',
-        descriptions: ['Real third point.', '(0:30) leaked description belonging to the intro'],
-      }),
-    ],
-    { minSeconds: 300, maxSeconds: 600 },
-    true
-  );
+test('relocates a mis-filed description to the chapter covering its time marker', () => {
+  const chapters = normalizeChapters([
+    chapter({ seconds: 0, title: 'Intro topic', descriptions: ['Point about the intro.'] }),
+    chapter({
+      seconds: 300,
+      title: 'Third topic',
+      descriptions: ['Real third point.', '(0:30) point belonging to the intro'],
+    }),
+  ]);
 
-  const leaked = chunk2[0].descriptions.find((d) => d.includes('leaked'));
-  assert.ok(leaked?.includes('0:30'), 'chunk-level pass must keep the time marker');
-
-  const finalChapters = normalizeChapters([...chunk1, ...chunk2]);
-
-  assert.equal(finalChapters.length, 3);
+  assert.equal(chapters.length, 2);
   assert.deepEqual(
-    finalChapters[0].descriptions,
-    ['Point about the intro.', 'leaked description belonging to the intro'],
-    'leaked description moves to the chapter covering 0:30 with its marker stripped'
+    chapters[0].descriptions,
+    ['Point about the intro.', 'point belonging to the intro'],
+    'mis-filed description moves to the chapter covering 0:30 with its marker stripped'
   );
-  assert.deepEqual(finalChapters[2].descriptions, ['Real third point.']);
+  assert.deepEqual(chapters[1].descriptions, ['Real third point.']);
+});
+
+test('leaves a bare mid-sentence time in place instead of treating it as a marker', () => {
+  // "3:16" here is prose, not a marker. Reading it as a time relocated the
+  // bullet from the 1:00:00 chapter to 0:00 and left the digits in the text.
+  const chapters = normalizeChapters([
+    chapter({ seconds: 0, title: 'Opening', descriptions: ['Point about the intro.'] }),
+    chapter({
+      seconds: 3600,
+      title: 'Scripture segment',
+      descriptions: ['John 3:16 was quoted as the key verse', 'A 4:30 win/loss ratio was cited'],
+    }),
+  ]);
+
+  assert.equal(chapters.length, 2);
+  assert.deepEqual(chapters[0].descriptions, ['Point about the intro.']);
+  assert.deepEqual(chapters[1].descriptions, [
+    'John 3:16 was quoted as the key verse',
+    'A 4:30 win/loss ratio was cited',
+  ]);
 });
 
 test('final pass strips time markers from descriptions', () => {
@@ -130,14 +131,14 @@ test('strips bracketed, parenthesized, and leading bare time markers', () => {
   assert.equal(stripTimeMarkers('설명 (1:00~1:20) 이어짐'), '설명 이어짐');
   assert.equal(stripTimeMarkers('26:58에서 설명한 내용'), '설명한 내용');
   assert.equal(stripTimeMarkers('no markers here'), 'no markers here');
+  // A bare time inside a sentence is prose, not a marker, and stays untouched.
+  assert.equal(
+    stripTimeMarkers('John 3:16 was quoted as the key verse'),
+    'John 3:16 was quoted as the key verse'
+  );
 });
 
 // ─── Output scaling ───────────────────────────────────────────────────────────
-
-function parseRange(range: string): { lo: number; hi: number } {
-  const [lo, hi] = range.split('-').map(Number);
-  return { lo, hi: hi ?? lo };
-}
 
 test('global output targets scale with video length instead of hitting a flat cap', () => {
   // ~30-minute video (3 chunks, ~15k tokens) vs ~3-hour video (19 chunks, ~95k tokens).
@@ -145,33 +146,33 @@ test('global output targets scale with video length instead of hitting a flat ca
   const long = deriveOutputTargets(180 * 60, 19, 95_000);
 
   assert.ok(
-    long.summaryParagraphs >= short.summaryParagraphs + 4,
-    `3-hour summary must span many more paragraphs (got ${long.summaryParagraphs} vs ${short.summaryParagraphs})`
+    long.summaryParagraphs > short.summaryParagraphs,
+    `3-hour summary must span more paragraphs (got ${long.summaryParagraphs} vs ${short.summaryParagraphs})`
   );
   assert.ok(
-    parseRange(long.summarySentences).lo >= parseRange(short.summarySentences).lo * 4,
-    `3-hour summary sentence floor must be several times the 30-minute one ` +
+    long.summarySentences >= short.summarySentences * 4,
+    `3-hour summary sentence target must be several times the 30-minute one ` +
       `(got ${long.summarySentences} vs ${short.summarySentences})`
   );
   assert.ok(
-    parseRange(long.takeawayCount).hi > parseRange(short.takeawayCount).hi * 2,
-    `3-hour takeaway ceiling must scale (got ${long.takeawayCount} vs ${short.takeawayCount})`
+    long.takeawayCount > short.takeawayCount * 2,
+    `3-hour takeaway target must scale (got ${long.takeawayCount} vs ${short.takeawayCount})`
   );
-  // The description band floor is proportional to transcript volume: 6x tokens → ~6x floor.
-  assert.ok(long.minDescriptions >= short.minDescriptions * 5);
+  // The description target is proportional to transcript volume: 6x tokens → ~6x target.
+  assert.ok(long.descriptionCount >= short.descriptionCount * 5);
 });
 
-test('output targets never fall below the pre-scaling fixed buckets at any length', () => {
-  // The old implementation used these fixed buckets; the continuous scaling may
-  // only ask for more at every duration, never less (no shorter-video regression).
-  const legacyBuckets = (durationSeconds: number, chunkCount: number) => {
+test('output targets never fall below the minimum floors at any length', () => {
+  // Mirror of the duration-bucketed floors in deriveOutputTargets: continuous
+  // scaling may only ask for more at every duration, never less.
+  const floorsFor = (durationSeconds: number, chunkCount: number) => {
     if (durationSeconds >= 45 * 60 || chunkCount >= 6) {
-      return { summary: [9, 14], chapters: [8, 18], takeaways: [8, 14] };
+      return { summary: 3, chapters: 8, takeaways: 7 };
     }
     if (durationSeconds >= 15 * 60 || chunkCount >= 3) {
-      return { summary: [6, 10], chapters: [6, 12], takeaways: [6, 10] };
+      return { summary: 2, chapters: 6, takeaways: 5 };
     }
-    return { summary: [4, 7], chapters: [4, 8], takeaways: [4, 7] };
+    return { summary: 2, chapters: 4, takeaways: 4 };
   };
 
   const cases: Array<[number, number, number]> = [
@@ -187,17 +188,16 @@ test('output targets never fall below the pre-scaling fixed buckets at any lengt
 
   for (const [durationSeconds, chunkCount, tokens] of cases) {
     const targets = deriveOutputTargets(durationSeconds, chunkCount, tokens);
-    const legacy = legacyBuckets(durationSeconds, chunkCount);
-    const checks: Array<[string, string, number[]]> = [
-      ['summary', targets.summarySentences, legacy.summary],
-      ['chapters', targets.chapterCount, legacy.chapters],
-      ['takeaways', targets.takeawayCount, legacy.takeaways],
+    const floors = floorsFor(durationSeconds, chunkCount);
+    const checks: Array<[string, number, number]> = [
+      ['summary', targets.summarySentences, floors.summary],
+      ['chapters', targets.chapterCount, floors.chapters],
+      ['takeaways', targets.takeawayCount, floors.takeaways],
     ];
-    for (const [label, range, [legacyLo, legacyHi]] of checks) {
-      const { lo, hi } = parseRange(range);
+    for (const [label, target, floor] of checks) {
       assert.ok(
-        lo >= legacyLo && hi >= legacyHi,
-        `${durationSeconds / 60}min ${label}: ${range} must not fall below legacy ${legacyLo}-${legacyHi}`
+        target >= floor,
+        `${durationSeconds / 60}min ${label}: ${target} must not fall below floor ${floor}`
       );
     }
   }
@@ -211,59 +211,82 @@ function makeChunk(overrides: Partial<TranscriptChunk> = {}): TranscriptChunk {
     tokenLength: 5000,
     startSeconds: 0,
     endSeconds: 600,
-    contextText: '',
     ...overrides,
   };
 }
 
-test('chunk description band is a variable range proportional to chunk content', () => {
+test('chunk description target is proportional to chunk content', () => {
   const targets = deriveChunkTargets(makeChunk());
-  const { lo, hi } = parseRange(targets.descriptionCount);
 
-  // The count is a band, not a fixed number: the ceiling must exceed the floor.
-  assert.ok(hi > lo, `descriptionCount must be a range, got ${targets.descriptionCount}`);
-  assert.equal(targets.minDescriptions, lo, 'minDescriptions is the low end of the band');
-  assert.ok(lo >= 8, `10-min 5000-token chunk should ask for a substantial floor, got ${lo}`);
-  assert.ok(parseRange(targets.chapterCount).lo >= 3);
+  assert.ok(
+    targets.descriptionCount >= 8,
+    `10-min 5000-token chunk should ask for a substantial target, got ${targets.descriptionCount}`
+  );
+  assert.ok(targets.chapterCount >= 2);
 
-  // A sparse chunk (few words over a long span) keeps a modest band.
+  // A sparse chunk (few words over a long span) keeps a modest target.
   const sparse = deriveChunkTargets(makeChunk({ tokenLength: 900, endSeconds: 3600 }));
-  assert.ok(parseRange(sparse.descriptionCount).lo <= 8);
+  assert.ok(sparse.descriptionCount <= 8);
 });
 
-test('detail level shifts the description band up or down for the same chunk', () => {
+test('chunk targets survive broken timestamps by falling back to token volume', () => {
+  // Every target cross-checks against wall-clock duration, so a chunk whose
+  // segments all carry the same (or a bogus) time must not collapse to minimums.
+  const healthy = deriveChunkTargets(makeChunk({ tokenLength: 13_000, endSeconds: 2340 }));
+  const broken = deriveChunkTargets(makeChunk({ tokenLength: 13_000, endSeconds: 0 }));
+
+  assert.ok(
+    broken.descriptionCount >= healthy.descriptionCount * 0.9,
+    `broken-timestamp chunk must keep its description target ` +
+      `(got ${broken.descriptionCount} vs ${healthy.descriptionCount})`
+  );
+  // The token-derived duration is a conservative lower bound (it assumes maximum
+  // speech density), so the duration-driven targets land lower than the healthy
+  // chunk's — but well clear of the 2-chapter / 2-takeaway floors they used to hit.
+  assert.ok(
+    broken.chapterCount >= healthy.chapterCount * 0.6,
+    `broken-timestamp chunk must keep a real chapter target ` +
+      `(got ${broken.chapterCount} vs ${healthy.chapterCount})`
+  );
+  assert.ok(broken.takeawayCount > 2, `expected a real takeaway target, got ${broken.takeawayCount}`);
+});
+
+test('detail level shifts the description target up or down for the same chunk', () => {
   const chunk = makeChunk();
   const concise = deriveChunkTargets(chunk, 'concise');
   const balanced = deriveChunkTargets(chunk, 'balanced');
   const exhaustive = deriveChunkTargets(chunk, 'exhaustive');
 
-  const lo = (t: ChunkTargets) => parseRange(t.descriptionCount).lo;
+  const target = (t: ChunkTargets) => t.descriptionCount;
 
   assert.ok(
-    lo(exhaustive) > lo(balanced) && lo(balanced) > lo(concise),
+    target(exhaustive) > target(balanced) && target(balanced) > target(concise),
     `expected exhaustive > balanced > concise, got ` +
-      `${lo(exhaustive)} / ${lo(balanced)} / ${lo(concise)}`
+      `${target(exhaustive)} / ${target(balanced)} / ${target(concise)}`
   );
   // The default level is balanced, and exhaustive is meaningfully denser than concise.
-  assert.deepEqual(
+  assert.equal(
     deriveChunkTargets(chunk).descriptionCount,
     balanced.descriptionCount,
     'default detail level must be balanced'
   );
-  assert.ok(lo(exhaustive) >= lo(concise) * 2, 'exhaustive should roughly double concise density');
+  assert.ok(
+    target(exhaustive) >= target(concise) * 2,
+    'exhaustive should roughly double concise density'
+  );
 
   // Each level carries a distinct tone rule for the prompt.
   assert.notEqual(concise.toneRule, exhaustive.toneRule);
 });
 
-test('detail level shifts the global (single-pass) description band too', () => {
+test('detail level shifts the global (single-pass) description target too', () => {
   const args: [number, number, number] = [20 * 60, 2, 9_000];
   const concise = deriveOutputTargets(...args, 'concise');
   const exhaustive = deriveOutputTargets(...args, 'exhaustive');
 
   assert.ok(
-    parseRange(exhaustive.descriptionCount).lo > parseRange(concise.descriptionCount).lo,
-    `exhaustive floor ${exhaustive.descriptionCount} must exceed concise ${concise.descriptionCount}`
+    exhaustive.descriptionCount > concise.descriptionCount,
+    `exhaustive target ${exhaustive.descriptionCount} must exceed concise ${concise.descriptionCount}`
   );
 });
 
@@ -371,4 +394,94 @@ test('a failed escalation retry keeps the first valid response', async () => {
   );
 
   assert.equal(result.chapters[0].descriptions.length, 2);
+});
+
+test('a transcript that splits into one chunk uses single-pass instead of chunk+synthesis', async () => {
+  // 1100 segments ≈ 22.7k tokens: over SINGLE_PASS_TOKEN_LIMIT, but the short
+  // trailing chunk folds back into its predecessor, so the split yields one
+  // chunk. That used to run the chunked path — two requests, and chapters
+  // capped by CHUNK_CHAPTER_CAP instead of the global target.
+  const segments: TranscriptSegment[] = Array.from({ length: 1100 }, (_, i) => ({
+    text: `Point number ${i} about the topic with some concrete detail ${i * 7}.`,
+    startSeconds: i * 5,
+    durationSeconds: 5,
+  }));
+  const { provider, requests } = makeProvider([summaryJson(60)]);
+
+  await summarizeWithProvider(provider, segments, makeMetadata(), 'test-model');
+
+  assert.equal(requests.length, 1, 'a single-chunk transcript must not pay for a synthesis pass');
+  assert.equal(requests[0].schemaName, 'video_summary');
+  assert.doesNotMatch(
+    requests[0].instructions,
+    /chunk/i,
+    'the request must use the single-pass prompt, not the per-chunk prompt'
+  );
+});
+
+test('the summary budget stays a short orientation even for a very long video', () => {
+  // The Summary section frames the notes; the chapter descriptions carry the
+  // detail. Budgets that let it run 20+ sentences turned it into a second copy
+  // of the chapters, so the ceiling is deliberately low at every length.
+  const hour = deriveOutputTargets(60 * 60, 1, 23_000);
+  assert.ok(
+    hour.summarySentences <= 4,
+    `a 1-hour video must ask for a handful of sentences, got ${hour.summarySentences}`
+  );
+
+  const threeHours = deriveOutputTargets(180 * 60, 19, 95_000);
+  assert.ok(
+    threeHours.summarySentences <= 8,
+    `even a 3-hour video must stay under the ceiling, got ${threeHours.summarySentences}`
+  );
+  assert.ok(
+    threeHours.summarySentences >= hour.summarySentences,
+    'the budget must still grow with length, just within a tight ceiling'
+  );
+});
+
+test('prompts tell the model to size each chapter by its own content, not evenly', async () => {
+  // A bare total target gets spent evenly: every chapter comes back with the
+  // same three or four bullets whether its section is dense or filler.
+  const { provider: singleProvider, requests: singleRequests } = makeProvider([summaryJson(12)]);
+  await summarizeWithProvider(singleProvider, makeSegments(), makeMetadata(), 'test-model');
+  assert.match(singleRequests[0].instructions, /Size every chapter independently/);
+
+  // 4000 segments ≈ 80k tokens, well past SINGLE_PASS_TOKEN_LIMIT, so this takes
+  // the chunked path and the first request is a per-chunk prompt.
+  const segments: TranscriptSegment[] = Array.from({ length: 4000 }, (_, i) => ({
+    text: `Point number ${i} about the topic with some concrete detail ${i * 7}.`,
+    startSeconds: i * 5,
+    durationSeconds: 5,
+  }));
+  // Answer by schema rather than by call index: the chunk count is a function of
+  // the split, so a fixed response list would break if it ever shifts.
+  const chunkRequests: StructuredSummaryRequest[] = [];
+  const chunkProvider: SummaryProvider = {
+    kind: 'openai',
+    name: 'Fake provider',
+    async generate(request) {
+      chunkRequests.push(request);
+      return request.schemaName === 'video_summary'
+        ? summaryJson(20)
+        : JSON.stringify({ summary: 'Global summary.', takeaways: ['A takeaway.'] });
+    },
+  };
+  await summarizeWithProvider(chunkProvider, segments, makeMetadata(), 'test-model');
+
+  assert.ok(chunkRequests.length > 1, 'this transcript must take the chunked path');
+  assert.match(chunkRequests[0].instructions, /Size every chapter independently/);
+});
+
+test('prompts require the summary to answer a question posed by the video title', async () => {
+  // A title written as a question is the one thing a reader opens the summary
+  // for; a brevity rule alone produces "the video explores whether X", which
+  // restates the question instead of answering it.
+  const { provider, requests } = makeProvider([summaryJson(12)]);
+  await summarizeWithProvider(provider, makeSegments(), makeMetadata(), 'test-model');
+
+  assert.match(requests[0].instructions, /If the title poses a question/);
+  assert.match(requests[0].instructions, /Restating or rephrasing the question is not an answer/);
+  // The rule is useless unless the title actually reaches the model.
+  assert.match(requests[0].input, /Title: Test video/);
 });

@@ -13,10 +13,14 @@ import { secondsToTimestamp } from './youtube.js';
 
 // ─── Constants & Types ────────────────────────────────────────────────────────
 
-// If full transcript token count is at or below this limit, summarize in one pass.
-const SINGLE_PASS_TOKEN_LIMIT = 5_000;
-// Target maximum tokens per chunk in chunked mode (kept below single-pass limit for prompt overhead headroom).
-const CHUNK_TOKEN_LIMIT = 5_000;
+// If full transcript token count is at or below this limit, summarize in one pass
+// (kept equal to the chunk limit so mid-length videos need a single request
+// instead of one chunk plus a synthesis pass).
+const SINGLE_PASS_TOKEN_LIMIT = 20_000;
+// Target maximum tokens per chunk in chunked mode. Sized to minimize request
+// count; per-chunk output targets scale with chunk tokens, so total detail is
+// roughly chunk-size-invariant (verified on a 3h video at 5k/10k/20k).
+const CHUNK_TOKEN_LIMIT = 20_000;
 // If the final chunk is smaller than this ratio of CHUNK_TOKEN_LIMIT, merge it into the previous chunk.
 const MIN_LAST_CHUNK_RATIO = 0.25;
 // Maximum number of concurrent GPT jobs when summarizing transcript chunks.
@@ -26,10 +30,13 @@ const MAX_CHUNK_SUMMARY_JOBS = 4;
 const CHUNK_SOFT_FILL_RATIO = 0.6;
 // A silent gap of at least this many seconds between segments is treated as a topic break.
 const SPEECH_GAP_BREAK_SECONDS = 2.5;
-// Leading overlap carried into each chunk (context only, no chapters), as a fraction of the budget.
-const CHUNK_OVERLAP_RATIO = 0.12;
-// Cap the leading overlap window so short, dense chunks don't pull in a huge preamble.
-const MAX_OVERLAP_SECONDS = 60;
+// Hard cap on chapters requested per chunk. This binds for every full-size chunk
+// (see deriveChunkTargets), so it — not the per-detail-level density — is what
+// sets chapter granularity in chunked mode.
+const CHUNK_CHAPTER_CAP = 9;
+// Conservative upper bound on speech density. Used to floor a duration estimate
+// from token volume, so broken or degenerate timestamps can't crush output targets.
+const MAX_TOKENS_PER_MINUTE = 700;
 // Chapters within this many seconds are treated as the same boundary and merged unconditionally.
 const CHAPTER_NEAR_SECONDS = 15;
 // Chapters within this window are merged only if their titles are also similar.
@@ -42,17 +49,17 @@ const MAX_API_ATTEMPTS = 3;
 // Base delay for exponential backoff between retries.
 const RETRY_BASE_DELAY_MS = 800;
 // If a response carries fewer than this fraction of the requested description
-// floor (the low end of the target band), re-request once with an escalated
-// prompt so a drastically under-detailed response still gets corrected.
+// target, re-request once with an escalated prompt so a drastically
+// under-detailed response still gets corrected.
 const DETAIL_RETRY_THRESHOLD = 0.7;
 
 /**
- * Per-detail-level tuning. `tokensPerDescription` sets the center density of the
- * description band (lower = denser = more bullets); `tokensPerChapter` does the
- * same for chapter boundaries. `toneRule` tells the model how aggressively to
- * split vs. merge points, so the count band and the writing style stay
+ * Per-detail-level tuning. `tokensPerDescription` sets the description target
+ * density (lower = denser = more bullets); `tokensPerChapter` does the same
+ * for chapter boundaries. `toneRule` tells the model how aggressively to
+ * split vs. merge points, so the count target and the writing style stay
  * consistent. Counts still scale with transcript volume at every level — the
- * level only shifts where the band sits.
+ * level only shifts where the target sits.
  */
 interface DetailProfile {
   tokensPerDescription: number;
@@ -62,20 +69,20 @@ interface DetailProfile {
 
 const DETAIL_PROFILES: Record<DetailLevel, DetailProfile> = {
   concise: {
-    tokensPerDescription: 360,
-    tokensPerChapter: 950,
+    tokensPerDescription: 750,
+    tokensPerChapter: 1400,
     toneRule:
       'Keep only the most important points. Aggressively merge related facts into a single entry and omit minor asides, tangents, repetition, and small talk. Favor a compact overview over completeness.',
   },
   balanced: {
-    tokensPerDescription: 210,
-    tokensPerChapter: 650,
+    tokensPerDescription: 450,
+    tokensPerChapter: 1000,
     toneRule:
       'Capture the substantive facts and specifics, but merge trivial or repetitive points and skip filler, greetings, and small talk. Do not drop concrete data (numbers, names, prices, dates, steps); do drop conversational padding.',
   },
   exhaustive: {
-    tokensPerDescription: 120,
-    tokensPerChapter: 480,
+    tokensPerDescription: 300,
+    tokensPerChapter: 720,
     toneRule:
       'Capture every distinct fact, claim, example, and step. Do not drop any concrete detail to keep the list short; prefer many precise entries over a few broad ones — the notes should let a reader skip the video entirely.',
   },
@@ -83,18 +90,15 @@ const DETAIL_PROFILES: Record<DetailLevel, DetailProfile> = {
 
 export interface TranscriptChunk {
   index: number;
-  /** Core segments — the authoritative content for this chunk's chapters. */
   segments: TranscriptSegment[];
-  /** Rendered core transcript text. */
+  /** Rendered transcript text for this chunk. */
   text: string;
-  /** Token length of the core text (drives per-chunk output targets). */
+  /** Token length of the text (drives per-chunk output targets). */
   tokenLength: number;
-  /** Core window start (used for display, native-chapter filtering, and validation). */
+  /** Window start (used for display, native-chapter filtering, and validation). */
   startSeconds: number;
-  /** Core window end. */
+  /** Window end. */
   endSeconds: number;
-  /** Leading overlap text from the previous chunk, for context only ('' if none). */
-  contextText: string;
 }
 
 interface ChunkSummary {
@@ -107,32 +111,34 @@ interface ChunkSummary {
 export interface OutputTargets {
   /** Number of paragraphs the global summary should be structured into. */
   summaryParagraphs: number;
-  summarySentences: string;
-  chapterCount: string;
-  takeawayCount: string;
-  /** Target band (e.g. "18-34") for total description entries — variable, not fixed. */
-  descriptionCount: string;
-  /** Low end of the description band; drives the escalation-retry threshold. */
-  minDescriptions: number;
+  summarySentences: number;
+  chapterCount: number;
+  takeawayCount: number;
+  /** Approximate target for total description entries; also the escalation-retry reference. */
+  descriptionCount: number;
   /** Detail-level tone rule steering how aggressively to split vs. merge points. */
   toneRule: string;
 }
 
 export interface ChunkTargets {
-  summarySentences: string;
-  chapterCount: string;
-  takeawayCount: string;
-  /** Target band for this chunk's total description entries — variable, not fixed. */
-  descriptionCount: string;
-  /** Low end of the description band; drives the escalation-retry threshold. */
-  minDescriptions: number;
+  summarySentences: number;
+  chapterCount: number;
+  takeawayCount: number;
+  /** Approximate target for this chunk's total description entries; also the escalation-retry reference. */
+  descriptionCount: number;
   /** Detail-level tone rule steering how aggressively to split vs. merge points. */
   toneRule: string;
 }
 
-/** Enforced detail floor for a structured summary request. */
-interface DetailRequirement {
-  minDescriptions: number;
+/** Optional behaviors for a structured summary request. */
+interface StructuredSummaryOptions {
+  /** Clamp window for chapter timestamps. */
+  bounds?: SecondsBounds;
+  /**
+   * Approximate description target; a response below DETAIL_RETRY_THRESHOLD
+   * of it gets one escalated retry.
+   */
+  descriptionTarget?: number;
 }
 
 type TokenCountCache = Map<string, number>;
@@ -156,8 +162,7 @@ function buildChunkFromText(
   index: number,
   segments: TranscriptSegment[],
   text: string,
-  tokenLength: number,
-  contextText: string = ''
+  tokenLength: number
 ): TranscriptChunk {
   const first = segments[0];
   const last = segments[segments.length - 1];
@@ -169,7 +174,6 @@ function buildChunkFromText(
     tokenLength,
     startSeconds: Math.max(0, Math.floor(first.startSeconds)),
     endSeconds: Math.max(0, Math.ceil(last.startSeconds + last.durationSeconds)),
-    contextText,
   };
 }
 
@@ -243,44 +247,9 @@ function computePreferredBreaks(
 }
 
 /**
- * Collects trailing segments immediately before `coreStartIndex` to serve as
- * read-only context (overlap) for the chunk starting there. Bounded by both a
- * token budget and a wall-clock window so we never pull in a large preamble.
- */
-function collectLeadingContext(
-  model: string,
-  segments: TranscriptSegment[],
-  coreStartIndex: number,
-  tokenBudget: number,
-  tokenCache: TokenCountCache
-): TranscriptSegment[] {
-  const newlineTokens = countTokens(model, '\n', tokenCache);
-  const coreStartSeconds = segments[coreStartIndex].startSeconds;
-  const picked: TranscriptSegment[] = [];
-  let tokens = 0;
-
-  for (let i = coreStartIndex - 1; i >= 0; i--) {
-    const seg = segments[i];
-    if (coreStartSeconds - seg.startSeconds > MAX_OVERLAP_SECONDS) {
-      break;
-    }
-    const segTokens = countTokens(model, segmentLine(seg), tokenCache) + newlineTokens;
-    if (picked.length > 0 && tokens + segTokens > tokenBudget) {
-      break;
-    }
-    picked.push(seg);
-    tokens += segTokens;
-  }
-
-  return picked.reverse();
-}
-
-/**
  * Splits the transcript into token-bounded chunks. Chunk boundaries are snapped
  * to natural break points (native chapters / speech pauses) once a chunk is
- * "soft-filled", and each chunk after the first carries a short leading overlap
- * from the previous section as read-only context. This avoids cutting a topic in
- * half and gives every chunk enough surrounding context to stay coherent.
+ * "soft-filled", so a topic isn't cut in half mid-discussion.
  */
 function splitTranscriptIntoChunks(
   model: string,
@@ -336,34 +305,11 @@ function splitTranscriptIntoChunks(
     }
   }
 
-  // 3. Build chunks, attaching leading overlap as read-only context.
-  const overlapTokenBudget = maxChunkTokens * CHUNK_OVERLAP_RATIO;
-  const chunks: TranscriptChunk[] = [];
-  let globalStart = 0;
-
-  for (const group of groups) {
-    const coreText = buildTranscriptText(group);
-    const coreTokens = countTokens(model, coreText, tokenCache);
-
-    let contextText = '';
-    if (globalStart > 0) {
-      const contextSegs = collectLeadingContext(
-        model,
-        segments,
-        globalStart,
-        overlapTokenBudget,
-        tokenCache
-      );
-      if (contextSegs.length > 0) {
-        contextText = buildTranscriptText(contextSegs);
-      }
-    }
-
-    chunks.push(buildChunkFromText(chunks.length, group, coreText, coreTokens, contextText));
-    globalStart += group.length;
-  }
-
-  return chunks;
+  // 3. Build chunks.
+  return groups.map((group, index) => {
+    const text = buildTranscriptText(group);
+    return buildChunkFromText(index, group, text, countTokens(model, text, tokenCache));
+  });
 }
 
 function estimateTranscriptDurationSeconds(segments: TranscriptSegment[]): number {
@@ -373,12 +319,12 @@ function estimateTranscriptDurationSeconds(segments: TranscriptSegment[]): numbe
 }
 
 /**
- * Derives global output targets that scale continuously with video length, so a
- * 3-hour video is asked for roughly 6x the overview/takeaway volume of a
- * 30-minute one instead of hitting a flat bucket cap. `chunkCount` cross-checks
- * duration: each ~5k-token chunk represents several minutes of real speech, so
- * a transcript with broken timestamps still scales with its actual volume.
- * Exported for tests.
+ * Derives global output targets that scale with video length up to deliberately
+ * tight caps — the Summary/takeaway sections grow with the video but stay a
+ * compact overview (chapter descriptions carry the detail). Token volume cross-checks
+ * duration in both directions, so sparse transcripts aren't over-asked and
+ * transcripts with broken timestamps still scale with their actual volume.
+ * `chunkCount` only backstops the legacy bucket floors. Exported for tests.
  */
 export function deriveOutputTargets(
   durationSeconds: number,
@@ -389,68 +335,62 @@ export function deriveOutputTargets(
   const profile = DETAIL_PROFILES[detail];
   // Duration is cross-checked against token volume so a sparse transcript
   // (music, long silences) isn't asked for more content than it holds;
-  // ~120 tokens/min is a conservative speech-density lower bound.
+  // ~120 tokens/min is a conservative speech-density lower bound. The
+  // MAX_TOKENS_PER_MINUTE floor works the other way: the token count alone
+  // vouches for that many minutes of real talk even when timestamps are broken.
   const minutes = Math.max(
     Math.min(durationSeconds / 60, transcriptTokens / 120),
-    chunkCount * 7,
+    transcriptTokens / MAX_TOKENS_PER_MINUTE,
     1
   );
 
-  // The pre-scaling fixed buckets act as a lower bound: continuous scaling may
-  // only ever ask for MORE than the old version did at any duration, never less.
+  // Duration-bucketed floors keep very short videos from collapsing to a
+  // one-liner; everything above them scales continuously.
   const isLong = durationSeconds >= 45 * 60 || chunkCount >= 6;
   const isMid = durationSeconds >= 15 * 60 || chunkCount >= 3;
   const floors = isLong
-    ? { summary: [9, 14], chapters: [8, 18], takeaways: [8, 14] }
+    ? { summary: 3, chapters: 8, takeaways: 7 }
     : isMid
-      ? { summary: [6, 10], chapters: [6, 12], takeaways: [6, 10] }
-      : { summary: [4, 7], chapters: [4, 8], takeaways: [4, 7] };
+      ? { summary: 2, chapters: 6, takeaways: 5 }
+      : { summary: 2, chapters: 4, takeaways: 4 };
 
-  // One overview paragraph per ~22 minutes; sentences track total length so the
-  // Summary section itself grows with the video instead of staying one paragraph.
-  const summaryParagraphs = Math.max(1, Math.min(9, Math.round(minutes / 22)));
-  const summaryMin = Math.max(floors.summary[0], Math.min(70, Math.round(minutes / 2.5)));
-  const summaryMax = Math.max(
-    floors.summary[1],
-    Math.min(90, Math.max(summaryMin + 2, Math.round(minutes / 1.6)))
+  // The Summary section is an orientation, not a second set of notes: the reader
+  // should get the through-line in a few sentences and go to the chapters for
+  // anything specific. Budgets are deliberately tight — roughly a third of what
+  // the section used to run — because a long summary duplicated the chapter
+  // descriptions instead of framing them.
+  const summarySentences = Math.max(floors.summary, Math.min(8, Math.round(minutes / 21)));
+  // Split only once the budget can carry two substantial paragraphs; below that a
+  // split just fragments an already short overview.
+  const summaryParagraphs = summarySentences >= 8 ? 2 : 1;
+
+  // Chapter targets are only used in single-pass mode; chunked mode derives
+  // chapters per chunk instead. Duration and token density cross-check each
+  // other with the smaller estimate winning (same rule as deriveChunkTargets),
+  // so a token-dense transcript isn't split into sub-minute chapters. Detail
+  // level shifts the density.
+  const chapterBase = Math.min(
+    Math.max(minutes / 4, 1),
+    Math.max(transcriptTokens / profile.tokensPerChapter, 1)
   );
+  const chapterCount = Math.max(floors.chapters, Math.round(chapterBase));
 
-  // Chapter targets are only used in single-pass mode (short videos); chunked
-  // mode derives chapters per chunk instead. Detail level shifts the density.
-  const chapterBase = Math.max(minutes / 2.5, transcriptTokens / profile.tokensPerChapter);
-  const chapterMin = Math.max(floors.chapters[0], Math.round(chapterBase * 0.8));
-  const chapterMax = Math.max(
-    floors.chapters[1],
-    chapterMin + 2,
-    Math.round(chapterBase * 1.3)
+  const takeawayCount = Math.max(floors.takeaways, Math.min(15, Math.round(minutes / 8)));
+
+  // Description target scales with transcript volume; detail level sets the density.
+  const descriptionCount = Math.max(
+    5,
+    Math.round(transcriptTokens / profile.tokensPerDescription)
   );
-
-  const takeawayMin = Math.max(floors.takeaways[0], Math.min(18, Math.round(minutes / 7)));
-  const takeawayMax = Math.max(
-    floors.takeaways[1],
-    Math.min(28, Math.max(takeawayMin + 2, Math.round(minutes / 4.5)))
-  );
-
-  // Description band scales with transcript volume; detail level sets the density.
-  const descBase = Math.max(8, transcriptTokens / profile.tokensPerDescription);
-  const descMin = Math.max(6, Math.round(descBase * 0.7));
-  const descMax = Math.max(descMin + 3, Math.round(descBase * 1.35));
 
   return {
     summaryParagraphs,
-    summarySentences: formatRange(summaryMin, summaryMax),
-    chapterCount: formatRange(chapterMin, chapterMax),
-    takeawayCount: formatRange(takeawayMin, takeawayMax),
-    descriptionCount: formatRange(descMin, descMax),
-    minDescriptions: descMin,
+    summarySentences,
+    chapterCount,
+    takeawayCount,
+    descriptionCount,
     toneRule: profile.toneRule,
   };
-}
-
-function formatRange(min: number, max: number): string {
-  const lo = Math.max(1, Math.round(min));
-  const hi = Math.max(lo, Math.round(max));
-  return lo === hi ? `${lo}` : `${lo}-${hi}`;
 }
 
 /**
@@ -458,50 +398,60 @@ function formatRange(min: number, max: number): string {
  * chunk, so denser sections produce proportionally more chapters and takeaways
  * instead of being squeezed into a fixed cap. Uses both wall-clock duration and
  * token count and takes the smaller estimate, so sparse chunks (e.g. music with
- * few words over a long span) don't get over-asked. The description band is the
- * main detail lever: it is stated in the prompt as a variable target range (not
- * a fixed count) and its low end is enforced by a detail-escalation retry, so
- * the model can't collapse every chunk to a similar size. The `detail` level
- * shifts where that band sits. Exported for tests.
+ * few words over a long span) don't get over-asked. The description target is
+ * the main detail lever: the prompt states it as a single approximate count,
+ * and an internal floor (70% of it) is enforced by a detail-escalation retry,
+ * so the model can't collapse every chunk to a similar size. The `detail`
+ * level shifts where that target sits — it moves descriptions at every chunk
+ * size, but chapters only for short or sparse chunks (see CHUNK_CHAPTER_CAP).
+ * Exported for tests.
  */
 export function deriveChunkTargets(
   chunk: TranscriptChunk,
   detail: DetailLevel = 'balanced'
 ): ChunkTargets {
   const profile = DETAIL_PROFILES[detail];
-  const durationMinutes = Math.max(0, (chunk.endSeconds - chunk.startSeconds) / 60);
+  // Every target below cross-checks against wall-clock duration, so a chunk whose
+  // timestamps are broken or degenerate (start == end) would collapse all of them
+  // to their minimums. Floor the estimate with the token volume the chunk provably
+  // holds, the same way deriveOutputTargets does.
+  const durationMinutes = Math.max(
+    (chunk.endSeconds - chunk.startSeconds) / 60,
+    chunk.tokenLength / MAX_TOKENS_PER_MINUTE
+  );
 
-  // ~1 chapter boundary per 2 minutes of talk, cross-checked against the detail-
+  // ~1 chapter boundary per 3 minutes of talk, cross-checked against the detail-
   // level token density; the smaller estimate wins so sparse chunks aren't over-asked.
-  const chaptersByDuration = durationMinutes / 2;
+  // Both estimates clear CHUNK_CHAPTER_CAP well before a chunk reaches full size, so
+  // for a full chunk the cap is what applies and the detail level does not move the
+  // chapter count — chapter granularity is a function of how many chunks there are.
+  const chaptersByDuration = durationMinutes / 3;
   const chaptersByTokens = chunk.tokenLength / profile.tokensPerChapter;
   const chapterBase = Math.min(chaptersByDuration, chaptersByTokens);
-  const chapterMin = Math.min(10, Math.max(2, Math.floor(chapterBase * 0.8)));
-  const chapterMax = Math.min(14, Math.max(chapterMin + 1, Math.ceil(chapterBase * 1.25)));
+  const chapterCount = Math.min(CHUNK_CHAPTER_CAP, Math.max(2, Math.round(chapterBase)));
 
-  // Description band: ~1 distinct point per profile.tokensPerDescription tokens,
-  // cross-checked against a per-minute cap so a very dense chunk isn't over-asked.
+  // Description target: ~1 distinct point per profile.tokensPerDescription tokens.
+  // The per-minute ceiling is a guard for pathological density only — it binds above
+  // ~1350 tokens/min at the balanced level, while real speech runs ~200-400.
   const descriptionBase = Math.min(
     chunk.tokenLength / profile.tokensPerDescription,
-    durationMinutes * 4.5
+    durationMinutes * 3
   );
-  const descMin = Math.max(4, Math.round(descriptionBase * 0.75));
-  const descMax = Math.max(descMin + 2, Math.round(descriptionBase * 1.3));
+  const descriptionCount = Math.max(4, Math.round(descriptionBase));
 
-  // Takeaways track content volume but stay a bit sparser than chapters.
-  const takeawayBase = Math.min(durationMinutes / 3, chunk.tokenLength / 800);
-  const takeawayMin = Math.max(2, Math.floor(takeawayBase * 0.7));
-  const takeawayMax = Math.max(takeawayMin + 1, Math.ceil(takeawayBase * 1.15));
+  // Takeaways track content volume on their own scale. At full chunk size they can
+  // exceed the capped chapter count; that is harmless because chunk takeaways are
+  // never rendered — they are only input to the final synthesis request.
+  const takeawayBase = Math.min(durationMinutes / 4.5, chunk.tokenLength / 1200);
+  const takeawayCount = Math.max(2, Math.round(takeawayBase));
 
-  const summaryMin = Math.max(3, Math.round(durationMinutes / 3));
-  const summaryMax = Math.max(summaryMin + 1, Math.round(durationMinutes / 1.8));
+  const summarySentences = Math.max(2, Math.round(durationMinutes / 4));
 
   return {
-    chapterCount: formatRange(chapterMin, chapterMax),
-    takeawayCount: formatRange(takeawayMin, takeawayMax),
-    summarySentences: formatRange(summaryMin, summaryMax),
-    descriptionCount: formatRange(descMin, descMax),
-    minDescriptions: descMin,
+    chapterCount,
+    takeawayCount,
+    summarySentences,
+    descriptionCount,
     toneRule: profile.toneRule,
   };
 }
@@ -575,17 +525,63 @@ function formatDescriptionSection(description: string): string {
 
 /**
  * Renders the summary sizing rules for global (single-pass / synthesis) prompts.
- * Long videos get a multi-paragraph chronological overview; the explicit
- * paragraph and sentence targets keep the Summary section proportional to the
- * video instead of collapsing to one paragraph regardless of length.
+ * The scope rule matters as much as the length target: given only a sentence
+ * count the model writes a condensed replay of the whole video and stops at the
+ * limit, which duplicates the chapter descriptions. Naming the section's job —
+ * orient the reader, let the chapters carry the specifics — is what keeps it
+ * short without losing the through-line.
+ *
+ * Brevity alone, though, degrades into a topic listing: "the talk discusses X and
+ * covers Y" fits any budget and tells the reader nothing. The payoff rules below
+ * fix what the space is spent on. The title rule is the sharpest case — YouTube
+ * titles are written to bait a click, so a question in the title is exactly the
+ * thing the reader opened the summary to have answered, and a summary that
+ * restates the question has failed at its one job.
  */
 function buildSummaryStructureRules(targets: OutputTargets): string {
   const structure =
     targets.summaryParagraphs <= 1
-      ? '- Write the summary as one dense paragraph'
+      ? '- Write the summary as one paragraph'
       : `- Structure the summary as ${targets.summaryParagraphs} paragraphs separated by blank lines, covering the video in chronological order`;
-  return `${structure}\n- Summary length target: ${targets.summarySentences} sentences in total`;
+  // A sentence count alone gets gamed: asked for 8 sentences the model writes 8
+  // sentences of 40+ words each and keeps every fact it meant to include. The
+  // word ceiling is what actually binds; ~25 words per sentence is ordinary prose.
+  const wordCeiling = targets.summarySentences * 25;
+  return (
+    `${structure}\n` +
+    `- Summary length: at most ${targets.summarySentences} sentences and about ${wordCeiling} words — ` +
+    'a ceiling, not a goal to fill. Do not compensate by writing longer sentences\n' +
+    '- The summary is a high-level orientation, not a recap: what the video is about, ' +
+    'the through-line it follows, and where it lands. Spend the limited space on the payoff; ' +
+    'leave supporting facts, figures, examples, and steps to the chapter descriptions\n' +
+    "- State the video's actual conclusions, findings, verdict, or recommendation in substance. " +
+    'Naming the topics it "discusses", "explores", or "covers" without saying what it concluded ' +
+    'about them is a failure — a reader must be able to learn the outcome from the summary alone\n' +
+    '- If the title poses a question, or promises a specific answer, verdict, result, number, ' +
+    'or comparison, give that answer outright in the summary and make it the priority. ' +
+    'Restating or rephrasing the question is not an answer. If the video genuinely never ' +
+    'settles it, say so explicitly and say why'
+  );
 }
+
+/**
+ * Per-chapter distribution rule shared by the single-pass and per-chunk prompts.
+ * Stated only as a total, the description target reads as a budget to divide and
+ * the model hands every chapter the same three-to-five entries no matter how
+ * much its section holds. The fix is to frame the count bottom-up — size each
+ * chapter on its own content and let the total land where it lands — and to name
+ * the uniform result as the failure, since the model cannot otherwise tell that
+ * its own even split is the thing being ruled out.
+ */
+const DESCRIPTION_DISTRIBUTION_RULE =
+  '- Size every chapter independently: give each one exactly as many entries as its own content ' +
+  'warrants, then let the total land where it lands. A core section dense with facts, figures, ' +
+  'examples, or steps may carry three or four times as many entries as a brief aside, recap, ' +
+  'restatement, or transition, which may deserve only one. Never add an entry to a chapter to match ' +
+  'its neighbors, and never trim a rich chapter to make room for a thin one.\n' +
+  '- Before finalizing, check the spread of entry counts across chapters. If nearly every chapter ' +
+  'landed on the same number, you sized them out of habit rather than by content — go back, cut the ' +
+  'thin chapters down and let the substantial ones grow.';
 
 function buildOutputLanguageRules(summaryLanguage?: string): string {
   if (!summaryLanguage) {
@@ -610,7 +606,7 @@ You MUST respond with ONLY a valid JSON object — no markdown code blocks, no e
 The JSON must conform exactly to this schema:
 
 {
-  "summary": "string — a dense chronological overview of the entire video (see summary structure rules)",
+  "summary": "string — a short orientation to the whole video that delivers its conclusions (see summary structure rules)",
   "chapters": [
     {
       "timestamp": "string — display time like '0:00', '14:32', or '1:04:30'",
@@ -627,15 +623,16 @@ The JSON must conform exactly to this schema:
 }
 
 Rules:
-- Detect between ${targets.chapterCount} meaningful chapter boundaries based on topic shifts
+- Detect around ${targets.chapterCount} meaningful chapter boundaries based on topic shifts
 - If native YouTube chapters are provided, treat them as strong hints but you may add or refine them
 - timestamps must be actual times from the transcript (do not invent times); copy the [H:MM:SS] value exactly and set "seconds" to its integer equivalent
-- Aim for roughly ${targets.descriptionCount} description entries in total across all chapters. Treat this as a variable target band, not a fixed quota: scale within it by how much distinct content the video holds — an information-dense video lands near the top, a thin or repetitive one near the bottom. Do not pad with duplicates or filler to reach the top, and do not compress real content to stay low.
+- Aim for roughly ${targets.descriptionCount} description entries in total across all chapters. Treat this as an approximate target, not a quota: let the amount of distinct content decide the exact count. Do not pad with duplicates or filler, and do not compress real content just to land on the number.
+${DESCRIPTION_DISTRIBUTION_RULE}
 - ${targets.toneRule}
 - Each description you do include must preserve concrete specifics from the transcript: numbers, prices, measurements, names, product/model names, dates, examples, and comparisons. Do not generalize away figures or proper nouns.
 - Write descriptions as plain prose. Do NOT put any timestamp, time range, or bracketed time (e.g. "[12:34]", "(1:00~1:20)") inside description text — the chapter's "timestamp"/"seconds" fields already mark the time
 - If the transcript contains obvious speech-to-text errors (misheard names, wrong homophones, garbled proper nouns), silently correct them to the most likely intended term from context; do not quote or flag the garbled version
-- Produce between ${targets.takeawayCount} takeaways
+- Produce around ${targets.takeawayCount} takeaways
 ${buildSummaryStructureRules(targets)}
 ${buildOutputLanguageRules(summaryLanguage)}
 - Do not include any text outside the JSON object`;
@@ -687,15 +684,15 @@ The JSON must conform exactly to this schema:
 
 Rules:
 - Use only information present in this chunk
-- Detect between ${targets.chapterCount} meaningful chapter boundaries inside this chunk
-- Aim for roughly ${targets.descriptionCount} description entries in total across this chunk's chapters. Treat this as a variable target band, not a fixed quota: scale within it by how much distinct content this chunk actually holds — a dense section lands near the top, a thin or repetitive one near the bottom. Do not pad with duplicates or filler to reach the top, and do not compress real content to stay low.
+- Detect around ${targets.chapterCount} meaningful chapter boundaries inside this chunk
+- Aim for roughly ${targets.descriptionCount} description entries in total across this chunk's chapters. Treat this as an approximate target, not a quota: let the amount of distinct content this chunk actually holds decide the exact count. Do not pad with duplicates or filler, and do not compress real content just to land on the number.
+${DESCRIPTION_DISTRIBUTION_RULE}
 - ${targets.toneRule}
 - Each description you do include must preserve concrete specifics from the transcript: numbers, prices, measurements, names, product/model names, dates, examples, comparisons, and step-by-step details. Do not generalize away figures or proper nouns.
-- Base every chapter, description, and takeaway ONLY on the TRANSCRIPT CHUNK section; never draw content from the PRECEDING CONTEXT lines (they exist only so you understand what came before)
 - Write descriptions as plain prose. Do NOT put any timestamp, time range, or bracketed time (e.g. "[12:34]", "(1:00~1:20)") inside description text — the chapter's "timestamp"/"seconds" fields already mark the time
 - If the transcript contains obvious speech-to-text errors (misheard names, wrong homophones, garbled proper nouns), silently correct them to the most likely intended term from context; do not quote or flag the garbled version
-- Produce between ${targets.takeawayCount} takeaways
-- Summary length target: ${targets.summarySentences} sentences
+- Produce around ${targets.takeawayCount} takeaways
+- Summary length target: about ${targets.summarySentences} sentences
 - timestamps must be actual times from this chunk (do not invent times); copy the [H:MM:SS] value exactly and set "seconds" to its integer equivalent
 ${buildOutputLanguageRules(summaryLanguage)}
 - Do not include any text outside the JSON object`;
@@ -714,13 +711,6 @@ function buildChunkUserPrompt(
   const descriptionSection = formatDescriptionSection(metadata.description);
   const outlineSection = formatVideoOutlineSection(metadata.nativeChapters);
 
-  const precedingContextSection = chunk.contextText
-    ? `PRECEDING CONTEXT (from the previous section — for understanding only; do NOT create chapters, descriptions, or takeaways from these lines):
-${chunk.contextText}
-
-`
-    : '';
-
   return `VIDEO METADATA:
 Title: ${metadata.title}
 Duration: ${metadata.duration}
@@ -733,7 +723,7 @@ Time window: ${secondsToTimestamp(chunk.startSeconds)} to ${secondsToTimestamp(c
 
 ${nativeChaptersSection}
 
-${precedingContextSection}TRANSCRIPT CHUNK (format: [MM:SS] or [H:MM:SS] text) — this is the section to analyze:
+TRANSCRIPT CHUNK (format: [MM:SS] or [H:MM:SS] text) — this is the section to analyze:
 ${chunk.text}
 
 Analyze ONLY the TRANSCRIPT CHUNK above (times ${secondsToTimestamp(chunk.startSeconds)} to ${secondsToTimestamp(chunk.endSeconds)}) and produce the JSON summary. All chapters and their timestamps must fall within this chunk's time window.`;
@@ -749,7 +739,7 @@ You MUST respond with ONLY a valid JSON object — no markdown code blocks, no e
 The JSON must conform exactly to this schema:
 
 {
-  "summary": "string — a dense chronological overview of the full video (see summary structure rules)",
+  "summary": "string — a short orientation to the whole video that delivers its conclusions (see summary structure rules)",
   "takeaways": [
     "string — one actionable or insightful bullet point for the full video"
   ]
@@ -758,11 +748,11 @@ The JSON must conform exactly to this schema:
 Rules:
 - Use only the provided chunk summaries and chunk chapters as source material
 - Remove duplicates and near-duplicates
-- Cover the main ideas across the full timeline of the video — every chunk's content must be represented, not just the early ones
+- The summary must span the full video, not stop at the early chunks — but span it at the level of the arc, not its contents. Naming where the video ends up is enough; the later chunks' specifics belong in their chapters, not here
 - Write a global full-video summary, not per-chunk summaries
 ${buildSummaryStructureRules(targets)}
 - Preserve concrete specifics (numbers, names, products, dates, examples) in both the summary and the takeaways; do not generalize them away
-- Produce between ${targets.takeawayCount} takeaways
+- Produce around ${targets.takeawayCount} takeaways
 ${buildOutputLanguageRules(summaryLanguage)}
 - Do not include any text outside the JSON object`;
 }
@@ -831,17 +821,16 @@ async function summarizeChunksWithConcurrency(
       );
 
       const chunkTargets = deriveChunkTargets(chunk, detail);
-      // keepTimeMarkers: cross-chunk relocation happens in the final global
-      // normalization pass, which needs the markers intact to work.
       const chunkResult = await requestStructuredSummary(
         provider,
         model,
         `chunk ${chunk.index + 1}/${chunks.length}`,
         buildChunkSystemPrompt(chunkTargets, summaryLanguage),
         buildChunkUserPrompt(metadata, chunk, chunks.length),
-        { minSeconds: chunk.startSeconds, maxSeconds: chunk.endSeconds },
-        true,
-        { minDescriptions: chunkTargets.minDescriptions }
+        {
+          bounds: { minSeconds: chunk.startSeconds, maxSeconds: chunk.endSeconds },
+          descriptionTarget: chunkTargets.descriptionCount,
+        }
       );
 
       results[currentIndex] = {
@@ -953,6 +942,16 @@ async function withRetries<T>(stage: string, fn: () => Promise<T>): Promise<T> {
   throw lastError;
 }
 
+/** Wraps a final (post-retry) provider error with actionable context for the user. */
+function buildProviderFailure(providerName: string, stage: string, err: unknown): Error {
+  return new Error(
+    `${providerName} request failed during ${stage} ` +
+      `(after up to ${MAX_API_ATTEMPTS} attempts).\n` +
+      `Check the provider login, model access, and available quota.\n` +
+      `Details: ${String(err)}`
+  );
+}
+
 function countDescriptionEntries(result: GptSummaryResponse): number {
   return result.chapters.reduce((sum, chapter) => sum + chapter.descriptions.length, 0);
 }
@@ -961,11 +960,13 @@ function countDescriptionEntries(result: GptSummaryResponse): number {
  * Escalation appended to the instructions when a response came back with far
  * fewer description entries than the transcript volume warrants. Each provider
  * call is stateless, so the previous (rejected) attempt is described inline.
+ * This corrective retry is the one place a hard lower bound is stated; regular
+ * prompts only carry a single approximate target.
  */
 function buildDetailEscalation(minDescriptions: number, gotCount: number): string {
   return (
     `\n\nDETAIL ESCALATION: A previous attempt at these notes produced only ${gotCount} ` +
-    `description entries in total, which is below the requested range for this much transcript. ` +
+    `description entries in total, which is far below the requested target for this much transcript. ` +
     `This time produce at least ${minDescriptions} description entries in total ` +
     `across all chapters. Work through the transcript and record each distinct ` +
     `fact, number, name, example, comparison, and step as its own description entry. ` +
@@ -979,10 +980,9 @@ async function requestStructuredSummary(
   stage: string,
   instructions: string,
   input: string,
-  bounds?: SecondsBounds,
-  keepTimeMarkers = false,
-  detail?: DetailRequirement
+  options: StructuredSummaryOptions = {}
 ): Promise<GptSummaryResponse> {
+  const { bounds, descriptionTarget } = options;
   const runAttempt = async (
     attemptStage: string,
     attemptInstructions: string
@@ -997,39 +997,33 @@ async function requestStructuredSummary(
       });
       return parseGptResponse(output);
     });
-    return normalizeSummary(parsed, bounds, keepTimeMarkers);
+    return normalizeSummary(parsed, bounds);
   };
 
   let result: GptSummaryResponse;
   try {
     result = await runAttempt(stage, instructions);
   } catch (err) {
-    throw new Error(
-      `${provider.name} request failed during ${stage} ` +
-        `(after up to ${MAX_API_ATTEMPTS} attempts).\n` +
-        `Check the provider login, model access, and available quota.\n` +
-        `Details: ${String(err)}`
-    );
+    throw buildProviderFailure(provider.name, stage, err);
   }
 
-  // Guard the low end of the detail band: models tend to compress every request
-  // to a similar output size, which is what makes long videos summarize like
-  // short ones. A response that falls clearly below the requested band's floor
-  // gets one escalated rewrite; keep whichever attempt carries more entries. The
-  // band's ceiling is left to the prompt, so this never forces extra verbosity
-  // beyond the requested floor.
-  if (detail) {
+  // Models tend to compress every request to a similar output size, which is
+  // what makes long videos summarize like short ones. A response far below the
+  // approximate description target gets one escalated rewrite; keep whichever
+  // attempt carries more entries. No upper bound is enforced, so this never
+  // forces extra verbosity.
+  if (descriptionTarget !== undefined) {
     const gotCount = countDescriptionEntries(result);
-    const retryFloor = Math.ceil(detail.minDescriptions * DETAIL_RETRY_THRESHOLD);
+    const retryFloor = Math.ceil(descriptionTarget * DETAIL_RETRY_THRESHOLD);
     if (gotCount < retryFloor) {
       console.warn(
         `${stage}: response has ${gotCount} description entries ` +
-          `(target floor: ${detail.minDescriptions}). Requesting a more detailed pass...`
+          `(~${descriptionTarget} requested). Requesting a more detailed pass...`
       );
       try {
         const escalated = await runAttempt(
           `${stage} (detail escalation)`,
-          instructions + buildDetailEscalation(detail.minDescriptions, gotCount)
+          instructions + buildDetailEscalation(descriptionTarget, gotCount)
         );
         if (countDescriptionEntries(escalated) > gotCount) {
           result = escalated;
@@ -1064,12 +1058,7 @@ async function requestFinalSynthesis(
       return parseFinalSynthesisResponse(output);
     });
   } catch (err) {
-    throw new Error(
-      `${provider.name} request failed during ${stage} ` +
-        `(after up to ${MAX_API_ATTEMPTS} attempts).\n` +
-        `Check the provider login, model access, and available quota.\n` +
-        `Details: ${String(err)}`
-    );
+    throw buildProviderFailure(provider.name, stage, err);
   }
 }
 
@@ -1109,21 +1098,25 @@ export async function summarizeWithProvider(
       `${segments.length} segments`
   );
 
-  if (transcriptTokenCount <= SINGLE_PASS_TOKEN_LIMIT) {
+  const runSinglePass = (reason: string): Promise<GptSummaryResponse> => {
     const targets = deriveOutputTargets(durationSeconds, 1, transcriptTokenCount, detail);
-    console.log(
-      `Transcript fits single-pass mode (<= ${SINGLE_PASS_TOKEN_LIMIT} tokens). ` +
-        `Detail: ${detail} (~${targets.descriptionCount} descriptions).`
-    );
+    console.log(`${reason} Detail: ${detail} (~${targets.descriptionCount} descriptions).`);
     return requestStructuredSummary(
       provider,
       model,
       'single-pass summarization',
       buildSinglePassSystemPrompt(targets, normalizedSummaryLanguage),
       buildSinglePassUserPrompt(metadata, transcriptText),
-      { minSeconds: 0, maxSeconds: durationSeconds },
-      false,
-      { minDescriptions: targets.minDescriptions }
+      {
+        bounds: { minSeconds: 0, maxSeconds: durationSeconds },
+        descriptionTarget: targets.descriptionCount,
+      }
+    );
+  };
+
+  if (transcriptTokenCount <= SINGLE_PASS_TOKEN_LIMIT) {
+    return runSinglePass(
+      `Transcript fits single-pass mode (<= ${SINGLE_PASS_TOKEN_LIMIT} tokens).`
     );
   }
 
@@ -1134,6 +1127,21 @@ export async function summarizeWithProvider(
     metadata.nativeChapters,
     CHUNK_TOKEN_LIMIT
   );
+
+  // A short trailing chunk gets folded back into its predecessor
+  // (MIN_LAST_CHUNK_RATIO), so a transcript just past the limit can come back as
+  // a single chunk. Running the chunked path on one chunk is exactly the "one
+  // chunk plus a synthesis pass" that SINGLE_PASS_TOKEN_LIMIT exists to avoid:
+  // it spends an extra request and swaps the global chapter target for the
+  // per-chunk CHUNK_CHAPTER_CAP, cutting chapters on a video that a few tokens
+  // fewer would have summarized in full.
+  if (chunks.length <= 1) {
+    return runSinglePass(
+      `Transcript split into a single chunk (${transcriptTokenCount} tokens); ` +
+        `using single-pass mode.`
+    );
+  }
+
   const targets = deriveOutputTargets(durationSeconds, chunks.length, transcriptTokenCount, detail);
 
   console.log(
@@ -1151,9 +1159,8 @@ export async function summarizeWithProvider(
   );
 
   console.log(`Combining and merging chapters from ${chunkSummaries.length} chunk(s)...`);
-  // Raw concatenation only; the final normalizeSummary below runs the single
-  // global pass that merges duplicate boundaries, relocates leaked descriptions
-  // across chunks, and strips the inline time markers.
+  // Raw concatenation; the final normalizeSummary below merges duplicate
+  // boundaries at chunk seams (each chunk's chapters are already normalized).
   const combinedChapters = chunkSummaries.flatMap((chunk) => chunk.result.chapters);
 
   console.log('Generating final summary and takeaways from chunk summaries...');
@@ -1174,7 +1181,12 @@ export async function summarizeWithProvider(
 
 // ─── Response Parsing ─────────────────────────────────────────────────────────
 
-function parseGptResponse(raw: string): GptSummaryResponse {
+/**
+ * Parses a raw model response into a JSON object, converting the failure modes
+ * shared by every structured request (refusal/empty output, invalid JSON,
+ * non-object payload) into descriptive errors.
+ */
+function parseJsonObjectResponse(raw: string): Record<string, unknown> {
   if (!raw || raw.trim() === '') {
     throw new Error('GPT returned an empty response. This may indicate a content policy refusal.');
   }
@@ -1194,7 +1206,11 @@ function parseGptResponse(raw: string): GptSummaryResponse {
     throw new Error(`GPT response was not a JSON object. Got: ${typeof parsed}`);
   }
 
-  const obj = parsed as Record<string, unknown>;
+  return parsed as Record<string, unknown>;
+}
+
+function parseGptResponse(raw: string): GptSummaryResponse {
+  const obj = parseJsonObjectResponse(raw);
 
   if (typeof obj['summary'] !== 'string' || obj['summary'].trim() === '') {
     throw new Error('GPT response missing or empty "summary" field.');
@@ -1251,26 +1267,8 @@ function parseGptResponse(raw: string): GptSummaryResponse {
 function parseFinalSynthesisResponse(
   raw: string
 ): Pick<GptSummaryResponse, 'summary' | 'takeaways'> {
-  if (!raw || raw.trim() === '') {
-    throw new Error('GPT returned an empty response.');
-  }
+  const obj = parseJsonObjectResponse(raw);
 
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch (err) {
-    throw new Error(
-      `GPT response was not valid JSON.\n` +
-        `Raw response:\n${raw.slice(0, 500)}\n` +
-        `Parse error: ${String(err)}`
-    );
-  }
-
-  if (typeof parsed !== 'object' || parsed === null) {
-    throw new Error(`GPT response was not a JSON object. Got: ${typeof parsed}`);
-  }
-
-  const obj = parsed as Record<string, unknown>;
   if (typeof obj['summary'] !== 'string' || obj['summary'].trim() === '') {
     throw new Error('GPT response missing or empty "summary" field.');
   }
@@ -1342,22 +1340,43 @@ function resolveChapterSeconds(chapter: Chapter, bounds?: SecondsBounds): number
 // Matches a display time token ("M:SS" or "H:MM:SS"). Seconds are constrained to
 // 00-59 so ratios like "3:2" (single trailing digit) don't register as times.
 const TIME_TOKEN_SOURCE = '\\d{1,2}:[0-5]\\d(?::[0-5]\\d)?';
+// A marker may name a range ("1:00~1:20"); only its start carries information.
+const TIME_RANGE_TAIL_SOURCE = `(?:\\s*[~\\-–]\\s*${TIME_TOKEN_SOURCE})?`;
+// Korean particle that can trail a bare leading marker ("26:58에서 …").
+const TIME_PARTICLE_SOURCE = '(?:에서는|에서|에는|엔|에|께|경|쯤|부터|까지|의)?';
+
+// The three forms that count as an explicit time marker, each capturing the
+// leading time token. Stripping and relocation both key off these, so a
+// description is only ever moved for a time we would also remove.
+const BRACKETED_MARKER_SOURCE = `\\[\\s*(${TIME_TOKEN_SOURCE})\\s*\\]`;
+const PARENTHESIZED_MARKER_SOURCE =
+  `\\(\\s*(${TIME_TOKEN_SOURCE})${TIME_RANGE_TAIL_SOURCE}\\s*\\)`;
+const LEADING_MARKER_SOURCE =
+  `^\\s*(${TIME_TOKEN_SOURCE})${TIME_RANGE_TAIL_SOURCE}${TIME_PARTICLE_SOURCE}[\\s,:\\-–]*`;
 
 /**
- * Extracts the first display time token in a description and returns it as
+ * Finds the first explicit time marker in a description and returns it as
  * seconds — the model's own claim of when this point occurs. Used to relocate a
- * description that was filed under the wrong chapter. Returns undefined if the
- * text has no timestamp.
+ * description that was filed under the wrong chapter.
+ *
+ * Only the three marker forms count. A bare mid-sentence time is not a marker:
+ * "John 3:16" and "a 4:30 win/loss ratio" are ordinary prose that happens to
+ * contain a colon, and reading them as times moved correct bullets into a
+ * distant wrong chapter. A missed relocation only leaves a bullet where the
+ * model filed it, which is the safer failure. Returns undefined if the text
+ * carries no marker.
  */
 function firstTimeMarkerSeconds(text: string): number | undefined {
-  const match = text.match(new RegExp(`(\\d{1,2}):([0-5]\\d)(?::([0-5]\\d))?`));
+  const match = text.match(
+    new RegExp(
+      `${BRACKETED_MARKER_SOURCE}|${PARENTHESIZED_MARKER_SOURCE}|${LEADING_MARKER_SOURCE}`
+    )
+  );
   if (!match) {
     return undefined;
   }
-  const first = Number(match[1]);
-  const second = Number(match[2]);
-  const third = match[3] !== undefined ? Number(match[3]) : undefined;
-  return third !== undefined ? first * 3600 + second * 60 + third : first * 60 + second;
+  const token = match[1] ?? match[2] ?? match[3];
+  return token === undefined ? undefined : parseTimestampToSeconds(token);
 }
 
 /**
@@ -1368,38 +1387,21 @@ function firstTimeMarkerSeconds(text: string): number | undefined {
  * Exported for tests.
  */
 export function stripTimeMarkers(text: string): string {
-  const bracketed = new RegExp(`\\[\\s*${TIME_TOKEN_SOURCE}\\s*\\]`, 'g');
-  const parenthesized = new RegExp(
-    `\\(\\s*${TIME_TOKEN_SOURCE}(?:\\s*[~\\-–]\\s*${TIME_TOKEN_SOURCE})?\\s*\\)`,
-    'g'
-  );
-  const leadingBare = new RegExp(
-    `^\\s*${TIME_TOKEN_SOURCE}(?:\\s*[~\\-–]\\s*${TIME_TOKEN_SOURCE})?` +
-      `(?:에서는|에서|에는|엔|에|께|경|쯤|부터|까지|의)?[\\s,:\\-–]*`
-  );
-
   return text
-    .replace(bracketed, ' ')
-    .replace(parenthesized, ' ')
-    .replace(leadingBare, '')
+    .replace(new RegExp(BRACKETED_MARKER_SOURCE, 'g'), ' ')
+    .replace(new RegExp(PARENTHESIZED_MARKER_SOURCE, 'g'), ' ')
+    .replace(new RegExp(LEADING_MARKER_SOURCE), '')
     .replace(/\s{2,}/g, ' ')
     .trim();
 }
 
 /**
- * Relocates descriptions filed under the wrong chapter (overlap leakage, or a
- * point whose time belongs to a later chapter) to the chapter that actually
- * covers their time marker, then strips the markers. Preserves every description
- * — nothing is dropped for being mis-timed, only moved. Chapters must be sorted
- * by seconds ascending.
- *
- * `keepTimeMarkers` skips the stripping step. Chunk-level normalization must
- * keep markers: a description leaked from the overlap context points at a time
- * before the chunk's own window, and only the later global pass (which sees all
- * chunks' chapters) can move it to the chapter that actually covers that time.
- * Stripping here would erase the only evidence the global pass relies on.
+ * Relocates descriptions filed under the wrong chapter to the chapter that
+ * actually covers their inline time marker, then strips the markers. Preserves
+ * every description — nothing is dropped for being mis-timed, only moved.
+ * Chapters must be sorted by seconds ascending.
  */
-function redistributeDescriptions(chapters: Chapter[], keepTimeMarkers = false): void {
+function redistributeDescriptions(chapters: Chapter[]): void {
   if (chapters.length === 0) {
     return;
   }
@@ -1451,19 +1453,15 @@ function redistributeDescriptions(chapters: Chapter[], keepTimeMarkers = false):
     chapters[i].descriptions = Array.from(
       new Set(
         chapters[i].descriptions
-          .map((text) => (keepTimeMarkers ? text.trim() : stripTimeMarkers(text)))
+          .map((text) => stripTimeMarkers(text))
           .filter((text) => text !== '')
       )
     );
   }
 }
 
-/** Exported for tests. See `redistributeDescriptions` for `keepTimeMarkers`. */
-export function normalizeChapters(
-  chapters: Chapter[],
-  bounds?: SecondsBounds,
-  keepTimeMarkers = false
-): Chapter[] {
+/** Exported for tests. */
+export function normalizeChapters(chapters: Chapter[], bounds?: SecondsBounds): Chapter[] {
   const sortedChapters = chapters
     .map((chapter) => {
       // Derive seconds from the (transcript-copied) timestamp, clamp to the window,
@@ -1486,9 +1484,9 @@ export function normalizeChapters(
     .filter((chapter) => chapter.title !== '' && chapter.descriptions.length > 0)
     .sort((a, b) => a.seconds - b.seconds);
 
-  // Merge chapters that describe the same boundary. Because adjacent chunks share
-  // overlapping context, two chunks often emit the same section a few seconds apart
-  // under slightly different titles; collapse those into one, unioning descriptions.
+  // Merge chapters that describe the same boundary. At a chunk seam the two chunks
+  // often open/close on the same section a few seconds apart under slightly
+  // different titles; collapse those into one, unioning descriptions.
   const mergedChapters: Chapter[] = [];
   for (const chapter of sortedChapters) {
     const last = mergedChapters[mergedChapters.length - 1];
@@ -1511,7 +1509,7 @@ export function normalizeChapters(
 
   // Relocate mis-timed descriptions to the chapter that covers their time, then
   // strip inline markers so every bullet reads as plain, consistently-formatted prose.
-  redistributeDescriptions(mergedChapters, keepTimeMarkers);
+  redistributeDescriptions(mergedChapters);
 
   const finalChapters = mergedChapters.filter((chapter) => chapter.descriptions.length > 0);
 
@@ -1555,11 +1553,10 @@ function titlesSimilar(a: string, b: string): boolean {
 
 function normalizeSummary(
   result: GptSummaryResponse,
-  bounds?: SecondsBounds,
-  keepTimeMarkers = false
+  bounds?: SecondsBounds
 ): GptSummaryResponse {
   const summary = result.summary.trim();
-  const dedupedChapters = normalizeChapters(result.chapters, bounds, keepTimeMarkers);
+  const dedupedChapters = normalizeChapters(result.chapters, bounds);
 
   const takeaways = normalizeTakeaways(result.takeaways);
 

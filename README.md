@@ -182,7 +182,7 @@ When YouTube exposes caption tracks but blocks the actual transcript or download
 
 ## Summary
 
-One paragraph overview of the video content.
+A few sentences orienting the reader: what the video covers and the conclusions that matter most. The specifics live in the chapters below.
 
 ## Chapters
 
@@ -301,29 +301,36 @@ The tool first attempts the Codex SDK with an active ChatGPT login. If that path
 1. **Normalize transcript**: convert each segment to `[MM:SS] spoken text` (or `[H:MM:SS]` past the one-hour mark).
 2. **Count tokens**: compute transcript size with `tiktoken` (fallback to `o200k_base`).
 3. **Choose mode**:
-   - **Single-pass** when total tokens are `<= 5000`
-   - **Chunked** when total tokens are `> 5000`
+   - **Single-pass** when total tokens are `<= 20000`, or when the split below yields only one chunk (up to ~`25000` tokens, since a short trailing chunk folds back into its predecessor). One chunk plus a synthesis pass would cost an extra request and swap the global chapter target for the per-chunk cap, so it is treated as single-pass.
+   - **Chunked** when the split yields two or more chunks.
 4. **Single-pass mode**: one GPT request with metadata, video description, native YouTube chapters, and full transcript.
 5. **Chunked mode**:
-   - Split into chunks targeting `5000` tokens, snapping boundaries to natural break points (native chapter starts or speech pauses) once a chunk is soft-filled, so a topic isn't cut mid-sentence.
+   - Split into chunks targeting `20000` tokens, snapping boundaries to natural break points (native chapter starts or speech pauses) once a chunk is soft-filled, so a topic isn't cut mid-sentence.
    - Merge tiny final chunk (`< 25%` of limit) into the previous chunk.
-   - Carry a short **read-only overlap** from the previous section into each chunk for context.
-   - Give each chunk the video description and full chapter outline, and scale its output targets (chapters / descriptions / takeaways) to the amount of content it holds — descriptions are asked for as a **variable target band** (e.g. `18-31`) proportional to transcript volume, so total detail grows with video length while the exact count still flexes with content density.
+   - Give each chunk the video description and full chapter outline, and scale its output targets to the amount of content it holds — descriptions are asked for as a **single approximate target** (e.g. `~45`) proportional to transcript volume, so total detail grows with video length while the exact count still flexes with content density. Chapters are the exception: a full-size chunk always hits `CHUNK_CHAPTER_CAP`, so chapter granularity follows the chunk count rather than content density or `--detail`.
    - Summarize each chunk in parallel (up to 4 concurrent jobs).
    - Combine chapters locally, merging near-in-time boundary duplicates that adjacent chunks emit.
-   - One final GPT request for full-video summary and takeaways. Summary paragraph/sentence and takeaway targets scale continuously with video duration (a 3-hour video gets a multi-paragraph chronological overview, not the same paragraph a 30-minute video gets).
-6. **Structured output + validation**: Codex SDK requests use `outputSchema`; OpenAI Responses API requests use strict `json_schema`. Transient failures retry with exponential backoff. A response that falls below the low end of the requested description band is re-requested once with an escalated prompt, keeping whichever attempt is more detailed (the band's ceiling is steered by the prompt, so this never forces extra verbosity). Chapter times are resolved from the (transcript-copied) timestamp, clamped to their section's window, and re-rendered so display and `?t=` link always agree.
+   - One final GPT request for full-video summary and takeaways. Takeaway targets scale with video duration; the summary is deliberately kept short (see below).
+6. **Structured output + validation**: Codex SDK requests use `outputSchema`; OpenAI Responses API requests use strict `json_schema`. Transient failures retry with exponential backoff. A response that falls far below the requested description target (under 70% of it) is re-requested once with an escalated prompt, keeping whichever attempt is more detailed. Chapter times are resolved from the (transcript-copied) timestamp, clamped to their section's window, and re-rendered so display and `?t=` link always agree.
 7. **Render Markdown**: convert to final output.
+
+### How the sections are sized
+
+**Summary** is an orientation, not a recap: what the video is about, the through-line, and where it lands. Its sentence budget scales with duration but stays under a hard ceiling of `8` (about 3 sentences for a 1-hour video, 8 for a 3-hour one), paired with a word ceiling — a sentence count alone gets gamed by writing longer sentences. Every supporting fact, figure, and example is handed to the chapters instead.
+
+The space that remains is spent on the payoff. The prompt requires the summary to state the video's actual conclusions, findings, or verdict rather than name the topics it "covers", and to answer the title outright when the title poses a question or promises a specific result — the case where a reader most needs the summary to deliver. If the video never settles the question, the summary says so explicitly.
+
+**Chapter bullets** are budgeted as one approximate *total* per request, never a per-chapter quota. The prompt requires that budget be spent unevenly: a section dense with substance carries several times more bullets than a brief or transitional one, which may warrant a single bullet. So bullet counts vary chapter to chapter with how much each section actually holds.
 
 ### Detail level
 
-`--detail` controls how densely the transcript is mined for bullets and chapters. The count still scales with video length and content density at every level — the flag only shifts the target band:
+`--detail` controls how densely the transcript is mined for bullets. The count still scales with video length and content density at every level — the flag only shifts where the target sits. It also shifts chapter density, but only for short or sparse sections: any full-size chunk is capped at `CHUNK_CHAPTER_CAP` chapters at every level.
 
 | Level | Density (≈ tokens per bullet) | Use when |
 |---|---|---|
-| `concise` | ~360 | You want a quick overview; minor points merged or dropped |
-| `balanced` (default) | ~210 | Substantive facts kept, filler/small-talk dropped |
-| `exhaustive` | ~120 | Near transcript-replacement; every distinct fact captured |
+| `concise` | ~750 | You want a quick overview; minor points merged or dropped |
+| `balanced` (default) | ~450 | Substantive facts kept, filler/small-talk dropped |
+| `exhaustive` | ~300 | Densest notes; every distinct fact captured |
 
 ### Token thresholds & tuning
 
@@ -331,15 +338,16 @@ Defined in `src/summarizer.ts`:
 
 | Constant | Value | Meaning |
 |---|---|---|
-| `SINGLE_PASS_TOKEN_LIMIT` | `5000` | Use single-pass below this |
-| `CHUNK_TOKEN_LIMIT` | `5000` | Target tokens per chunk |
+| `SINGLE_PASS_TOKEN_LIMIT` | `20000` | Use single-pass below this (also used whenever the split yields one chunk) |
+| `CHUNK_TOKEN_LIMIT` | `20000` | Target tokens per chunk |
 | `MIN_LAST_CHUNK_RATIO` | `0.25` | Merge final chunk if smaller than 25% of limit |
 | `CHUNK_SOFT_FILL_RATIO` | `0.6` | Fraction of budget after which a chunk closes at the next natural boundary |
 | `SPEECH_GAP_BREAK_SECONDS` | `2.5` | Silent gap treated as a topic break |
-| `CHUNK_OVERLAP_RATIO` | `0.12` | Leading read-only overlap carried into each chunk |
+| `CHUNK_CHAPTER_CAP` | `9` | Max chapters per chunk; binds for every full-size chunk, so it sets chapter granularity |
+| `MAX_TOKENS_PER_MINUTE` | `700` | Speech-density ceiling used to floor duration estimates when timestamps are broken |
 | `MAX_API_ATTEMPTS` | `3` | Attempts per GPT request before giving up |
 | `DETAIL_PROFILES` | per level | Tokens-per-description / per-chapter density and tone for each `--detail` level |
-| `DETAIL_RETRY_THRESHOLD` | `0.7` | Escalate once if a response falls below this fraction of the description band's floor |
+| `DETAIL_RETRY_THRESHOLD` | `0.7` | Escalate once if a response falls below this fraction of the description target |
 
 ---
 
